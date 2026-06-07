@@ -39,3 +39,24 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+dist/
+*.pkl
+*.joblib
+*.model
+
+# trading data
+*.csv
+*.jsonl
+trades.jsonl
+
+# deployment artifacts
+*.tar.gz
+vps_*.txt
+vps_*.log
