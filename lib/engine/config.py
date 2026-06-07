@@ -1,5 +1,19 @@
 # -*- coding: utf-8 -*-
 import os
+from pathlib import Path
+
+# --- Load .env.local if present (so env vars work on VPS without pm2 config) ---
+_env_local = Path(__file__).resolve().parent.parent.parent / ".env.local"
+if _env_local.exists():
+    for line in _env_local.read_text("utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip("\"'")
+        if key and not os.environ.get(key):  # Don't override actual env vars
+            os.environ[key] = val
 
 # --- AI ---
 AI_API_KEY = os.getenv("AI_API_KEY", "")

@@ -60,3 +60,5 @@ trades.jsonl
 *.tar.gz
 vps_*.txt
 vps_*.log
+scripts/deploy_vps.py
+scripts/deploy_vps.py
