@@ -114,6 +114,9 @@ class TradingEngine:
         self.total_pnl = 0.0
         self.total_wins = 0
         self.total_losses = 0
+        # 启动预热: 第一根K线不交易, 等下一根新K线
+        self._warmup_done: dict[str, bool] = {s: False for s in config.SYMBOLS}
+        self._csv_last_mtime = 0.0  # CSV最后修改时间, 用于检测数据新鲜度
 
     def start(self):
         self.reset_state()
@@ -127,9 +130,11 @@ class TradingEngine:
             self.balance = 0.0
         self.start_balance = self.balance
         emit("balance_update", {"balance": self.balance})
+        # 重置预热标记
+        self._warmup_done = {s: False for s in config.SYMBOLS}
         profit_target = config.BOOTSTRAP_TARGET - config.INITIAL_CAPITAL
         label = "🚀 TURBO" if self.turbo else "普通"
-        emit("log", {"msg": f"{label}启动! 余额{self.balance:.2f}U | 3U定投 +{profit_target}U→凯利 | 阈值={'0.50' if self.turbo else '0.55'}"})
+        emit("log", {"msg": f"{label}启动! 余额{self.balance:.2f}U | 3U定投 +{profit_target}U→凯利 | 阈值={'0.50' if self.turbo else '0.55'} | 预热中: 等下一根新K线再开单"})
 
     def stop(self):
         self.running = False
@@ -154,62 +159,59 @@ class TradingEngine:
 
     def _check_settlement(self):
         """
-        通过HIBT余额变化来判断订单是否已结算
-        不虚构settle, 只查HIBT真实余额
+        通过HIBT余额变化来判断订单是否已结算。
+        对比 (当前余额 - 前次余额快照) 来判断盈亏, 赢和输都能正确检测。
         """
         if not self.active_trades:
             return
 
-        current_balance = fetch_balance()
-        if current_balance < 0:
+        new_balance = fetch_balance()
+        if new_balance < 0:
+            # HIBT接口故障, 无法结算判断
             return
 
-        # 计算余额变化
-        # 持仓总额: 所有active_trade的bet总和(冻结金额)
-        frozen = sum(t["amount"] for t in self.active_trades)
-        # 可用余额 = current_balance
-        # 如果余额恢复到下单前的水平, 说明订单已结算
+        prev_balance = self.balance
+        balance_changed = abs(new_balance - prev_balance) > 0.005
 
         for i in range(len(self.active_trades) - 1, -1, -1):
             t = self.active_trades[i]
             elapsed = time.time() * 1000 - t["start_ts"]
-            # 还没到到期时间
+
+            # 还没到到期时间, 跳过
             if elapsed < config.HOLD_MINUTES * 60000:
                 continue
 
-            # 到期了: 用HIBT余额变化判断盈亏
-            # 查完HIBT余额后, 差额 = 当前余额 - (下单时余额 - bet)
-            # 但这个不精确, 因为可能有其他订单同时结算
-            # 更准确: 看冻结额是否释放
-            new_balance = fetch_balance()
-            if new_balance < 0:
+            # 到期了, 判断余额是否发生了变化
+            # 赢: 余额增加 (本金返还 + 盈利)
+            # 输: 余额减少 (本金亏掉, 无返还)
+            # 都没变化: 可能还没结算完, 继续等
+
+            if not balance_changed:
+                # 余额没动, 还没结算完
                 continue
 
-            # 如果新余额 >= 冻结前的可用余额, 说明已释放+结算
-            # 下单前可用 ≈ t["pre_balance"]
-            pre_balance = t.get("pre_balance", 0)
-            if new_balance >= pre_balance - 0.01:
-                # 结算完成! 判断盈亏
-                pnl = new_balance - pre_balance
-                is_win = pnl > 0
-                if is_win:
-                    self.total_wins += 1
-                else:
-                    self.total_losses += 1
-                self.total_pnl += pnl
-                self._record_result(is_win)
-                result = "win" if is_win else "loss"
-                emit("trade_result", {
-                    "symbol": t["symbol"], "result": result, "pnl": round(pnl, 4),
-                    "entryPrice": t["entry"], "dir": t["dir"],
-                })
-                notify_result(t["symbol"], is_win, pnl)
-                self.active_trades.pop(i)
-                self.balance = new_balance
-                emit("balance_update", {"balance": new_balance})
+            # 余额有变化, 判断盈亏
+            pnl = new_balance - prev_balance
+            # 输单: 余额少了约 bet 的量
+            # 赢单: 余额多了约 bet * payout 的量
+            is_win = pnl > 0
+
+            if is_win:
+                self.total_wins += 1
             else:
-                # 还没结算完
-                pass
+                self.total_losses += 1
+            self.total_pnl += pnl
+            self._record_result(is_win)
+            result = "win" if is_win else "loss"
+            emit("trade_result", {
+                "symbol": t["symbol"], "result": result, "pnl": round(pnl, 4),
+                "entryPrice": t["entry"], "dir": t["dir"],
+            })
+            notify_result(t["symbol"], is_win, pnl)
+            self.active_trades.pop(i)
+            self.balance = new_balance
+            emit("balance_update", {"balance": new_balance})
+            emit("log", {"msg": f"结算 {t['symbol']}: {'赢' if is_win else '输'} {abs(pnl):.2f}U | 余额→{new_balance:.2f}U"})
 
     def _record_result(self, is_win: bool):
         self.recent_results.append(is_win)
@@ -287,6 +289,15 @@ class TradingEngine:
             return
 
         current_bar_ts = data.index[-1]
+
+        # 启动预热: 跳过当前这根已存在的K线, 等下一根新K线再交易
+        # 避免用半残的旧K线误判方向
+        if not self._warmup_done.get(symbol, False):
+            self.last_signal_bar_ts[symbol] = current_bar_ts
+            self._warmup_done[symbol] = True
+            emit("log", {"msg": f"预热完成 {symbol}: 跳过当前K线 {current_bar_ts}, 等待下一根新K线"})
+            return
+
         if self.last_signal_bar_ts.get(symbol) == current_bar_ts:
             return
 
