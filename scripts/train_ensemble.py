@@ -191,8 +191,8 @@ def make_labels(feat: pd.DataFrame, fwd: int = 2) -> pd.Series:
     up = (fh / cur - 1)
     dn = (fl / cur - 1)
     label = pd.Series(0, index=feat.index, dtype=int)
-    label[(up > 0.003) & (up.abs() >= dn.abs())] = 1
-    label[(dn < -0.003) & (dn.abs() > up.abs())] = -1
+    label[(up > 0.0015) & (up.abs() >= dn.abs())] = 1
+    label[(dn < -0.0015) & (dn.abs() > up.abs())] = -1
     return label
 
 
