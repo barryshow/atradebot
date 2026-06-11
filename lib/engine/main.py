@@ -28,30 +28,35 @@ from lib.engine.engine import TradingEngine, emit
 
 
 def stdin_reader(engine: TradingEngine):
-    """Read commands from stdin (sent by Node.js ProcessManager)."""
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            cmd = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    """Read commands from stdin (sent by Node.js ProcessManager).
+    Gracefully handles nohup/PM2 mode where stdin is closed."""
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                cmd = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-        action = cmd.get("command", "")
-        if action == "start":
-            engine.start()
-        elif action == "stop":
-            engine.stop()
-            break
-        elif action == "pause":
-            engine.pause()
-        elif action == "resume":
-            engine.resume()
-        elif action == "ping":
-            emit("pong", {"ts": int(time.time() * 1000)})
-        elif action == "status":
-            emit("status", engine.get_status())
+            action = cmd.get("command", "")
+            if action == "start":
+                engine.start()
+            elif action == "stop":
+                engine.stop()
+                break
+            elif action == "pause":
+                engine.pause()
+            elif action == "resume":
+                engine.resume()
+            elif action == "ping":
+                emit("pong", {"ts": int(time.time() * 1000)})
+            elif action == "status":
+                emit("status", engine.get_status())
+    except (OSError, EOFError, ValueError):
+        # stdin closed (nohup/PM2/systemd mode) — silent exit
+        pass
 
 
 def main():
@@ -89,10 +94,6 @@ def main():
         # Emit status heartbeat
         emit("status", engine.get_status())
         time.sleep(2)
-
-        # Check if stdin thread is still alive
-        if not reader.is_alive():
-            break
 
 
 if __name__ == "__main__":
