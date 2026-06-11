@@ -30,9 +30,9 @@ def emit(event_type: str, payload: dict):
     sys.stdout.flush()
 
 
-def _calc_30m_features(data_30m: pd.DataFrame) -> dict | None:
-    """30分钟特征计算 (同predictor训练用特征一致)"""
-    d = data_30m.copy()
+def _calc_30m_features(data_feat: pd.DataFrame) -> dict | None:
+    """特征计算 (在 FEATURE_INTERVAL_MIN 聚合K线上计算, 保持与训练特征一致)"""
+    d = data_feat.copy()
     eps = 1e-10
     d["volume"] = d["volume"].fillna(0).replace(0, 0.001)
     d["ret_1"] = d["close"].pct_change(1).fillna(0)
@@ -131,7 +131,7 @@ class TradingEngine:
         emit("balance_update", {"balance": self.balance})
         # 重置预热标记
         self._warmup_done = {s: False for s in config.SYMBOLS}
-        emit("log", {"msg": f"启动! 余额{self.balance:.2f}U | 凯利滚仓 | 阈值0.62 | 预热中: 等下一根新K线再开单"})
+        emit("log", {"msg": f"启动! 余额{self.balance:.2f}U | 凯利滚仓 | 阈值0.62 | K线检测:{config.CANDLE_INTERVAL_MIN}分 | 特征聚合:{config.FEATURE_INTERVAL_MIN}分 | 持仓:{config.HOLD_MINUTES}分 | 预热中: 等下一根新K线再开单"})
 
     def stop(self):
         self.running = False
@@ -264,27 +264,38 @@ class TradingEngine:
         if len(df_s) < 200:
             return
         df_s.set_index("datetime", inplace=True)
-        data = df_s.resample("15min").agg({
+
+        # --- 1分钟K线用于信号检测（每分钟检查新信号） ---
+        candle_min = config.CANDLE_INTERVAL_MIN  # 默认1
+        detect_data = df_s.resample(f"{candle_min}min").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
         }).dropna()
-        if len(data) < 200:
+        if len(detect_data) < 10:
             return
 
-        current_bar_ts = data.index[-1]
+        current_bar_ts = detect_data.index[-1]
 
         # 启动预热: 跳过当前这根已存在的K线, 等下一根新K线再交易
-        # 避免用半残的旧K线误判方向
         if not self._warmup_done.get(symbol, False):
             self.last_signal_bar_ts[symbol] = current_bar_ts
             self._warmup_done[symbol] = True
-            emit("log", {"msg": f"预热完成 {symbol}: 跳过当前K线 {current_bar_ts}, 等待下一根新K线"})
+            emit("log", {"msg": f"预热完成 {symbol}: 跳过当前{candle_min}分K线 {current_bar_ts}"})
             return
 
         if self.last_signal_bar_ts.get(symbol) == current_bar_ts:
             return
 
-        row = _calc_30m_features(data)
+        # --- 15分钟聚合用于特征计算（保持模型兼容） ---
+        feat_min = config.FEATURE_INTERVAL_MIN  # 默认15
+        feature_data = df_s.resample(f"{feat_min}min").agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum",
+        }).dropna()
+        if len(feature_data) < 200:
+            return
+
+        row = _calc_30m_features(feature_data)
         if row is None:
             return
 

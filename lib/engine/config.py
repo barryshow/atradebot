@@ -32,7 +32,16 @@ FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
 # --- Trading (激进) ---
 SYMBOLS = os.getenv("TRADE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
 PAYOUT_RATES = {"BTCUSDT": 0.818, "ETHUSDT": 0.80, "SOLUSDT": 0.80}
-HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "5"))
+
+# 持仓时间（分钟） — 建议15或30，避免短期无序波动
+HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "15"))
+
+# K线检测粒度（分钟） — 每分钟检查一次是否有新信号
+CANDLE_INTERVAL_MIN = int(os.getenv("CANDLE_INTERVAL_MIN", "1"))
+
+# 特征计算聚合粒度（分钟） — 用更长时间窗口算特征，保持模型兼容
+FEATURE_INTERVAL_MIN = int(os.getenv("FEATURE_INTERVAL_MIN", "15"))
+
 MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "999"))  # 不限制
 TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "120"))
 REJECT_COOLDOWN_SEC = int(os.getenv("REJECT_COOLDOWN_SEC", "30"))
