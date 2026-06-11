@@ -7,7 +7,7 @@ export interface ServerConfig {
 
 export function getServerConfig(): ServerConfig {
   return {
-    pythonPath: process.env.PYTHON_PATH || "python3",
+    pythonPath: process.env.PYTHON_PATH || (process.platform === "win32" ? "python" : "python3"),
     engineDir: process.env.ENGINE_DIR || "./lib/engine",
     radarCsvPath:
       process.env.RADAR_CSV_PATH || "/root/quant_bot/hibt_ticks.csv",

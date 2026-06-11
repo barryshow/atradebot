@@ -37,7 +37,10 @@ export class ProcessManager extends EventEmitter {
       return { ok: false, error: `Already ${this.state}` };
     }
 
-    const pythonPath = process.env.PYTHON_PATH || "python3";
+    let pythonPath = process.env.PYTHON_PATH;
+    if (!pythonPath) {
+      pythonPath = process.platform === "win32" ? "python" : "python3";
+    }
     const engineDir = path.resolve(/* turbopackIgnore: true */ process.cwd(), "lib", "engine");
     const mainPy = path.join(engineDir, "main.py");
 
