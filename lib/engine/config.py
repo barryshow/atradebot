@@ -32,28 +32,18 @@ FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
 # --- Trading (激进) ---
 SYMBOLS = os.getenv("TRADE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",")
 PAYOUT_RATES = {"BTCUSDT": 0.818, "ETHUSDT": 0.80, "SOLUSDT": 0.80}
-FIXED_BET = float(os.getenv("FIXED_BET", "3"))
 HOLD_MINUTES = int(os.getenv("HOLD_MINUTES", "5"))
 MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "999"))  # 不限制
 TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "120"))
 REJECT_COOLDOWN_SEC = int(os.getenv("REJECT_COOLDOWN_SEC", "30"))
 
-# --- 本金管理: 两阶段 + Turbo加速 ---
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "14"))   # 14U启动金
-BOOTSTRAP_TARGET = float(os.getenv("BOOTSTRAP_TARGET", "26"))
-BOOTSTRAP_MODE = os.getenv("BOOTSTRAP_MODE", "turbo")         # "normal" 或 "turbo"
-BET_MODE = os.getenv("BET_MODE", "fixed")
-BET_BASE = int(FIXED_BET)
-FIXED_BET_MIN = int(os.getenv("FIXED_BET_MIN", "3"))
-FIXED_BET_MAX = int(os.getenv("FIXED_BET_MAX", "15"))
+# --- 本金管理: 凯利滚仓 ---
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "14"))
 
-# --- 凯利公式参数 (启动成功后启用) ---
+# --- 凯利公式参数 ---
 KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.50"))   # 半凯利(保守), 可调
-BET_MIN = int(os.getenv("BET_MIN", "3"))                       # 最低3U(凯利)
-BET_MAX = int(os.getenv("BET_MAX", "50"))                      # 上限(凯利)
-
-# --- 启动成功条件 ---
-BOOTSTRAP_TARGET = float(os.getenv("BOOTSTRAP_TARGET", "26"))
+BET_MIN = int(os.getenv("BET_MIN", "3"))                       # 最低3U
+BET_MAX = int(os.getenv("BET_MAX", "50"))                      # 上限
 
 # --- Data ---
 CSV_FILE = os.getenv("RADAR_CSV_PATH", "./hibt_ticks.csv")

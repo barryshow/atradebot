@@ -61,4 +61,10 @@ trades.jsonl
 vps_*.txt
 vps_*.log
 scripts/deploy_vps.py
-scripts/deploy_vps.py
+
+# local-only VPS / ops scripts (contain credentials, keep off GitHub)
+scripts/vps_*.py
+scripts/start_vps.sh
+
+# local Claude Code workspace
+.claude/

@@ -108,8 +108,7 @@ class TradingEngine:
         self.consecutive_losses = 0
         self.halted = False
         self.pause_until = 0
-        self.bet_mode = "fixed"
-        self.turbo = config.BOOTSTRAP_MODE.lower() == "turbo"
+        self.bet_mode = "kelly"
         # 已结算的盈亏
         self.total_pnl = 0.0
         self.total_wins = 0
@@ -122,7 +121,7 @@ class TradingEngine:
         self.reset_state()
         self.running = True
         n = predictor.load_models()
-        predictor.set_bootstrap_mode(True, turbo=self.turbo)
+        predictor.set_bootstrap_mode()
         emit("status", {"state": "running", "models_loaded": n})
         # 从HIBT拿真实余额
         self.balance = fetch_balance()
@@ -132,9 +131,7 @@ class TradingEngine:
         emit("balance_update", {"balance": self.balance})
         # 重置预热标记
         self._warmup_done = {s: False for s in config.SYMBOLS}
-        profit_target = config.BOOTSTRAP_TARGET - config.INITIAL_CAPITAL
-        label = "🚀 TURBO" if self.turbo else "普通"
-        emit("log", {"msg": f"{label}启动! 余额{self.balance:.2f}U | 3U定投 +{profit_target}U→凯利 | 阈值={'0.50' if self.turbo else '0.55'} | 预热中: 等下一根新K线再开单"})
+        emit("log", {"msg": f"启动! 余额{self.balance:.2f}U | 凯利滚仓 | 阈值0.62 | 预热中: 等下一根新K线再开单"})
 
     def stop(self):
         self.running = False
@@ -225,24 +222,12 @@ class TradingEngine:
                 self.halted = True
                 emit("log", {"msg": f"连亏{self.consecutive_losses}笔, 暂停! 需手动恢复"})
             elif self.consecutive_losses >= 3:
-                pause_ms = (config.CONSECUTIVE_LOSS_PAUSE_SEC * 1000) // (2 if self.turbo and self.bet_mode == "fixed" else 1)
+                pause_ms = config.CONSECUTIVE_LOSS_PAUSE_SEC * 1000
                 self.pause_until = int(time.time() * 1000) + pause_ms
                 emit("log", {"msg": f"连亏{self.consecutive_losses}笔, 冷冻{pause_ms//1000}秒"})
 
     def _get_bet(self) -> int:
-        profit = self.balance - self.start_balance
-        profit_target = config.BOOTSTRAP_TARGET - config.INITIAL_CAPITAL
-
-        # 检测启动成功
-        if self.bet_mode == "fixed" and profit >= profit_target:
-            self.bet_mode = "kelly"
-            predictor.set_bootstrap_mode(False)
-            emit("log", {"msg": f"启动成功! 利润+{profit:.1f}U >= +{profit_target}U, 切换凯利"})
-
-        if self.bet_mode == "fixed":
-            return config.FIXED_BET_MIN
-
-        # 凯利
+        # 凯利滚仓 — 永远用凯利公式计算仓位
         recent = self.recent_results[-50:] or self.recent_results
         if len(recent) < 5:
             return max(3, min(int(self.balance * 0.05), 10))
@@ -269,11 +254,9 @@ class TradingEngine:
             return
         if symbol not in predictor.ENSEMBLE_MODELS:
             return
-        cooldown = config.TRADE_COOLDOWN_SEC // (2 if self.turbo and self.bet_mode == "fixed" else 1)
-        if current_ts - self.last_trade_ts.get(symbol, 0) < cooldown * 1000:
+        if current_ts - self.last_trade_ts.get(symbol, 0) < config.TRADE_COOLDOWN_SEC * 1000:
             return
-        rej_cd = config.REJECT_COOLDOWN_SEC // (2 if self.turbo and self.bet_mode == "fixed" else 1)
-        if current_ts - self.last_reject_ts.get(symbol, 0) < rej_cd * 1000:
+        if current_ts - self.last_reject_ts.get(symbol, 0) < config.REJECT_COOLDOWN_SEC * 1000:
             return
 
         # 数据准备
@@ -419,7 +402,6 @@ class TradingEngine:
         if self.pause_until > int(time.time() * 1000):
             state = "cooling"
         profit = self.balance - self.start_balance if self.start_balance > 0 else 0
-        profit_target = config.BOOTSTRAP_TARGET - config.INITIAL_CAPITAL
         return {
             "state": state, "balance": self.balance,
             "wins": self.total_wins, "losses": self.total_losses,
@@ -427,5 +409,5 @@ class TradingEngine:
             "maxConcurrentTrades": 999,
             "consecutiveLosses": self.consecutive_losses,
             "currentBet": self._get_bet(), "betMode": self.bet_mode,
-            "profit": round(profit, 2), "bootstrapProfitTarget": profit_target,
+            "profit": round(profit, 2),
         }

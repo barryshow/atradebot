@@ -4,7 +4,6 @@ export async function GET() {
   // Return non-sensitive config
   return NextResponse.json({
     symbols: (process.env.TRADE_SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT").split(","),
-    fixedBet: Number(process.env.FIXED_BET) || 3,
     holdMinutes: Number(process.env.HOLD_MINUTES) || 5,
     maxConcurrentTrades: Number(process.env.MAX_CONCURRENT_TRADES) || 3,
     tradeCooldownSec: Number(process.env.TRADE_COOLDOWN_SEC) || 180,

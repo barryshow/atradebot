@@ -13,7 +13,6 @@ export interface EngineStatus {
   lastTick: string | null;
   betMode?: string;
   profit?: number;
-  bootstrapProfitTarget?: number;
 }
 
 export type EngineEventType =

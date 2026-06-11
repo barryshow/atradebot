@@ -2,9 +2,7 @@
 """
 多模型集成30分钟预测引擎
 
-两阶段阈值:
-  - 启动期(fixed 3U): 阈值0.55 (信号多, 快翻倍)
-  - 凯利期(kelly):   阈值0.65 (更保守, 保护利润)
+统一阈值: 0.62 (凯利滚仓, 永远 62%+ 胜率才开单)
 
 训练数据显示PUT胜率59-62%, 所以PUT信号更可靠
 """
@@ -16,7 +14,7 @@ from .models import Prediction
 
 ENSEMBLE_MODELS = {}
 MODEL_CONFIGS = {}
-_CURRENT_THRESHOLD = 0.55  # 启动期默认
+_CURRENT_THRESHOLD = 0.62  # 统一阈值
 
 
 def load_models():
@@ -35,20 +33,9 @@ def load_models():
     return len(ENSEMBLE_MODELS)
 
 
-def set_bootstrap_mode(enabled: bool, turbo: bool = True):
-    """
-    启动期:
-      Turbo: threshold=0.45 (用15m模型最优阈值)
-      普通:  threshold=0.50
-    凯利期: threshold=0.65 (更保守)
-    """
+def set_bootstrap_mode(enabled: bool = True, turbo: bool = True):
     global _CURRENT_THRESHOLD
-    if not enabled:
-        _CURRENT_THRESHOLD = 0.65
-    elif turbo:
-        _CURRENT_THRESHOLD = 0.45
-    else:
-        _CURRENT_THRESHOLD = 0.50
+    _CURRENT_THRESHOLD = 0.62  # 统一 62% 阈值
 
 
 def predict(symbol: str, row) -> Optional[Prediction]:
