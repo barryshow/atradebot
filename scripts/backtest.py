@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-离线回测 v3：直接在15分钟K线上逐根检测，速度快30倍
-比较 5 / 15 / 30 分钟持仓胜率
-
+离线回测 v4：预计算特征，超高速
+直接在15分钟K线上逐根检测
 用法: python3 scripts/backtest.py
 """
 import sys, os, warnings, time
@@ -15,11 +14,11 @@ import numpy as np
 from curl_cffi import requests
 
 from lib.engine import predictor, config
-from lib.engine.engine import _calc_30m_features
 
 MIN_PROB = 0.62
 PAYOUT = 0.80
-SYMBOLS_MAP = {"BTCUSDT": "BTC_USDT", "ETHUSDT": "ETH_USDT", "SOLUSDT": "SOL_USDT"}
+FEATURES_CACHE = {}  # 预计算的特征缓存
+
 
 def fetch_klines(pair, interval="15m", days=60):
     api = "https://api.gateio.ws/api/v4/spot/candlesticks"
@@ -46,47 +45,85 @@ def fetch_klines(pair, interval="15m", days=60):
     return df.dropna(subset=["open","close"])
 
 
-def backtest_symbol_15m(df_15m, hold_min):
-    """
-    直接在15分钟K线上回测。
-    每根新15分钟K线 → 算特征 → 预测 → 记录。
-    hold_min: 持仓分钟数 (5/15/30)
-    """
-    if len(df_15m) < 250:
+def calc_all_features(df):
+    """一次性计算所有行的全部特征，返回特征矩阵(行索引同df)"""
+    d = df.copy()
+    eps = 1e-10
+    d["volume"] = d["volume"].fillna(0).replace(0, 0.001)
+    d["ret_1"] = d["close"].pct_change(1).fillna(0)
+    d["ret_3"] = d["close"].pct_change(3).fillna(0)
+    d["ret_6"] = d["close"].pct_change(6).fillna(0)
+    e12 = d["close"].ewm(span=12, adjust=False).mean()
+    e26 = d["close"].ewm(span=26, adjust=False).mean()
+    macd = e12 - e26
+    d["MACD"] = (2 * (macd - macd.ewm(span=9, adjust=False).mean())).fillna(0)
+    d["MACD_hist"] = d["MACD"].fillna(0)
+    delta = d["close"].diff().fillna(0)
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean().replace(0, eps)
+    d["RSI"] = (100 - (100 / (1 + gain / loss))).fillna(50)
+    mid = d["close"].rolling(20).mean()
+    std = d["close"].rolling(20).std().fillna(0)
+    d["BB_Pos"] = ((d["close"] - (mid - 2 * std)) / (4 * std + eps)).clip(0, 1)
+    d["BB_width"] = (((mid + 2 * std) - (mid - 2 * std)) / (mid + eps)).fillna(0)
+    tr = pd.concat([d["high"]-d["low"],(d["high"]-d["close"].shift(1)).abs(),(d["low"]-d["close"].shift(1)).abs()], axis=1).max(axis=1)
+    d["ATR_pct"] = (tr.rolling(14).mean() / (d["close"] + eps)).fillna(0)
+    up = d["high"] - d["high"].shift(1)
+    dn = d["low"].shift(1) - d["low"]
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0), index=d.index)
+    ndm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0), index=d.index)
+    tr14 = tr.rolling(14).sum().replace(0, eps)
+    pdi = 100 * pdm.rolling(14).sum() / tr14
+    ndi = 100 * ndm.rolling(14).sum() / tr14
+    d["ADX"] = (100 * abs(pdi - ndi) / (pdi + ndi + eps)).rolling(14).mean().fillna(20)
+    d["MA10"] = d["close"].rolling(10).mean().bfill()
+    d["MA20"] = d["close"].rolling(20).mean().bfill()
+    d["MA50"] = d["close"].rolling(50).mean().bfill()
+    d["price_vs_MA20"] = ((d["close"] - d["MA20"]) / (d["MA20"] + eps)).fillna(0)
+    d["price_vs_MA50"] = ((d["close"] - d["MA50"]) / (d["MA50"] + eps)).fillna(0)
+    d["MA_trend"] = np.sign(d["MA10"] - d["MA20"]).fillna(0)
+    tp = (d["high"] + d["low"] + d["close"]) / 3
+    vwap = (d["volume"] * tp).cumsum() / (d["volume"].cumsum() + eps)
+    d["VWAP_dist"] = ((d["close"] - vwap) / (vwap + eps)).fillna(0)
+    d["vol_ratio"] = (d["volume"] / (d["volume"].rolling(5).mean() + eps)).fillna(1)
+    obv_dir = np.sign(d["close"].diff().fillna(0))
+    obv = (d["volume"] * obv_dir).cumsum()
+    d["OBV_trend"] = np.sign(obv - obv.shift(5)).fillna(0)
+    tp_sma = tp.rolling(20).mean()
+    tp_mad = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    d["CCI"] = ((tp - tp_sma) / (0.015 * tp_mad + eps)).fillna(0)
+    atr14 = tr.rolling(14).sum()
+    d["CHOP"] = (100 * np.log10(atr14 / (d["high"].rolling(14).max() - d["low"].rolling(14).min() + eps)) / np.log10(14)).fillna(50)
+    body = (d["close"] - d["open"]).abs()
+    d["body_pct"] = (body / (d["high"] - d["low"] + eps)).fillna(0.5)
+    d["is_green"] = (d["close"] > d["open"]).astype(int)
+    return d.replace([np.inf, -np.inf], np.nan)
+
+
+def backtest_symbol(feat_df, hold_min):
+    """在预计算的特征上快速回测"""
+    if len(feat_df) < 250:
         return []
 
     trades = []
     last_bar_ts = None
     warmup = True
 
-    # 预计算全局特征（一次性算完所有行的特征）
-    full_feat = _calc_30m_features(df_15m)
-
-    # 逐根K线滑动检测
-    for i in range(len(df_15m)):
-        bar = df_15m.iloc[i]
+    for i in range(200, len(feat_df)):
+        bar = feat_df.iloc[i]
         bar_ts = bar.name
 
-        # 预热：跳过前200根（特征需要200根历史）
         if warmup:
-            if i < 200:
-                continue
             warmup = False
             last_bar_ts = bar_ts
             continue
-
-        # 同一根不重复
         if last_bar_ts == bar_ts:
             continue
 
-        # 取到当前K线为止的特征数据
-        feat_slice = df_15m.iloc[:i+1]
-        if len(feat_slice) < 200:
-            last_bar_ts = bar_ts
-            continue
-
-        row = _calc_30m_features(feat_slice)
-        if row is None:
+        row = feat_df.iloc[i]  # 特征已经算好了
+        # NaN检查
+        adx_val = row.get("ADX")
+        if pd.isna(adx_val):
             last_bar_ts = bar_ts
             continue
 
@@ -96,18 +133,17 @@ def backtest_symbol_15m(df_15m, hold_min):
             last_bar_ts = bar_ts
             continue
 
-        # 风控：ADX震荡过滤
-        adx = float(row.get("ADX", 20))
-        rsi = float(row.get("RSI", 50))
-        if adx < 18 and 35 < rsi < 65:
+        # ADX震荡过滤
+        rsi_val = row.get("RSI", 50)
+        if adx_val < 18 and 35 < rsi_val < 65:
             last_bar_ts = bar_ts
             continue
 
         entry_price = float(bar["close"])
 
-        # 找持仓结束时的价格（按15分钟K线找）
+        # 找持仓结束
         exit_time = bar_ts + pd.Timedelta(minutes=hold_min)
-        future = df_15m[df_15m.index >= exit_time]
+        future = feat_df[feat_df.index >= exit_time]
         if future.empty:
             last_bar_ts = bar_ts
             continue
@@ -122,8 +158,8 @@ def backtest_symbol_15m(df_15m, hold_min):
             "exit": round(exit_price, 1),
             "prob": round(pred.prob_win, 3),
             "result": "WIN" if is_win else "LOSS",
-            "adx": round(adx, 1),
-            "rsi": round(rsi, 1),
+            "adx": round(adx_val, 1),
+            "rsi": round(rsi_val, 1),
         })
         last_bar_ts = bar_ts
 
@@ -132,8 +168,8 @@ def backtest_symbol_15m(df_15m, hold_min):
 
 def main():
     print("=" * 60)
-    print("  ATradeBot 离线回测 v3")
-    print("  数据: Gate.io 15m K线 | 逐根检测")
+    print("  ATradeBot 离线回测 v4")
+    print("  数据: Gate.io 15m K线 | 预计算特征")
     print(f"  阈值: {MIN_PROB} | 赔付率: {PAYOUT*100:.0f}%")
     print("=" * 60)
 
@@ -141,35 +177,37 @@ def main():
     print(f"  模型: {n}/{len(config.SYMBOLS)} 个\n")
 
     all_data = {}
-    for sym, pair in SYMBOLS_MAP.items():
+    for sym, pair in [("BTCUSDT", "BTC_USDT"), ("ETHUSDT", "ETH_USDT"), ("SOLUSDT", "SOL_USDT")]:
         print(f"  [{sym}] 拉取数据...", end=" ", flush=True)
         df = fetch_klines(pair, "15m", 60)
         if df is None or len(df) < 300:
-            print(f"失败或数据不足")
+            print("失败或数据不足")
             continue
-        print(f"{len(df)} 根 ({df.index[0].date()} ~ {df.index[-1].date()})")
-        all_data[sym] = df
+        print(f"{len(df)} 根", end=" ", flush=True)
+        # 预计算特征
+        sys.stdout.flush()
+        feat_df = calc_all_features(df)
+        feat_df = feat_df.dropna()
+        print(f"(特征 {len(feat_df)} 行)")
+        all_data[sym] = feat_df
 
     if not all_data:
-        print("  没有可用数据，退出")
+        print("  没有数据，退出")
         return
 
     results = {}
     for hold in [5, 15, 30]:
-        print(f"\n  {'='*60}")
-        print(f"  持仓 {hold} 分钟")
-        print(f"  {'='*60}")
+        print(f"\n  --- 持仓 {hold} 分钟 ---")
         results[hold] = {}
         for sym, df in all_data.items():
-            trades = backtest_symbol_15m(df, hold)
+            trades = backtest_symbol(df, hold)
             wins = sum(1 for t in trades if t["result"] == "WIN")
             losses = len(trades) - wins
             profit = wins * PAYOUT - losses * 1.0
             wr = wins / len(trades) * 100 if trades else 0
             results[hold][sym] = (len(trades), wins, losses, wr, profit, trades)
-
             if trades:
-                print(f"  {sym:>10}: {len(trades):>4}次 {wins:>3}胜 {losses:>3}负 {wr:>5.1f}% 利润{profit:>+7.2f}U/单")
+                print(f"  {sym:>10}: {len(trades):>4}次 {wins:>3}胜 {losses:>3}负 {wr:>5.1f}% 利润{profit:>+7.2f}U/单", flush=True)
 
     # 汇总
     print(f"\n\n  {'='*60}")
@@ -180,6 +218,7 @@ def main():
 
     best_hold, best_profit = 15, -999
     for hold in [5, 15, 30]:
+        if hold not in results: continue
         total_t = sum(results[hold][s][0] for s in results[hold])
         total_w = sum(results[hold][s][1] for s in results[hold])
         total_l = sum(results[hold][s][2] for s in results[hold])
@@ -192,15 +231,14 @@ def main():
 
     print(f"\n  最优: {best_hold}分钟持仓 (利润 {best_profit:+.2f}U/单)")
 
-    # 显示最优持仓的明细
     print(f"\n  {best_hold}分钟持仓 — 最近交易:")
     for sym in all_data:
         trades = results[best_hold][sym][5]
         if trades:
-            print(f"\n  {sym} (最近{min(8,len(trades))}笔):")
+            print(f"\n  {sym} (最近{min(10,len(trades))}笔):")
             print(f"  {'时间':>12} {'方向':>5} {'入场':>10} {'出场':>10} {'概率':>6} {'结果':>5}")
             print(f"  {'-'*48}")
-            for t in trades[-8:]:
+            for t in trades[-10:]:
                 r = "WIN " if t["result"] == "WIN" else "LOSS"
                 print(f"  {t['ts']:>12} {t['dir']:>5} {t['entry']:>10} {t['exit']:>10} {t['prob']:.3f} {r:>5}")
 
