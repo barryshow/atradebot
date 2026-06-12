@@ -227,14 +227,55 @@ class TradingEngine:
                 emit("log", {"msg": f"连亏{self.consecutive_losses}笔, 冷冻{pause_ms//1000}秒"})
 
     def _get_bet(self) -> int:
-        # 凯利滚仓 — 永远用凯利公式计算仓位
-        recent = self.recent_results[-50:] or self.recent_results
-        if len(recent) < 5:
-            return max(3, min(int(self.balance * 0.05), 10))
+        """仓位管理三阶段:
+        阶段1(冷启动, <5笔): 保底下注3U, 专等积累足够数据
+        阶段2(连败保护, >=2连败): 锁死3U, 不亏本金
+        阶段3(凯利顺加仓, ≥5笔且连盈): 半凯利+连胜加成
+        -- 全程整数, 始终 ≥3U ≤50U
+        """
+        bet = config.BET_MIN  # 3U保底
 
-        win_rate = sum(recent) / len(recent)
+        recent = self.recent_results[-50:] or self.recent_results
+        total = len(recent)
+
+        if total < 5:
+            # 数据不够, 3U硬干, 积累样本
+            return bet
+
+        # 连胜/连败(从最近一次往前数)
+        consecutive_wins = 0
+        consecutive_losses = 0
+        for r in reversed(recent):
+            if r:
+                consecutive_wins += 1
+            else:
+                break
+        for r in reversed(recent):
+            if not r:
+                consecutive_losses += 1
+            else:
+                break
+
+        # 连败保护: 锁死3U
+        if consecutive_losses >= config.LOSE_STREAK_TRIGGER:
+            return bet
+
+        win_rate = sum(recent) / total
+
+        # 胜率不够55%不配谈凯利, 继续3U保本
+        if win_rate < 0.55:
+            return bet
+
+        # 半凯利计算
         b = 0.80
-        kelly = max(0, (win_rate * b - (1 - win_rate)) / b) * config.KELLY_FRACTION
+        kelly = max(0.0, (win_rate * b - (1 - win_rate)) / b) * config.KELLY_FRACTION
+
+        # 连胜加成: 2连胜1.5x, 3连胜以上再叠加1.2x
+        if consecutive_wins >= config.WIN_STREAK_TRIGGER:
+            kelly *= config.WIN_STREAK_BOOST
+            if consecutive_wins >= 3:
+                kelly *= 1.2
+
         bet = int(self.balance * kelly)
         bet = max(config.BET_MIN, min(config.BET_MAX, bet))
         return bet
