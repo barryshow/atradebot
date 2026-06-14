@@ -14,7 +14,7 @@ from .models import Prediction
 
 ENSEMBLE_MODELS = {}
 MODEL_CONFIGS = {}
-_CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.56"))  # 默认0.56
+_CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.62"))  # 默认0.62
 
 
 def load_models():
@@ -35,15 +35,15 @@ def load_models():
 
 def set_bootstrap_mode(enabled: bool = True, turbo: bool = True):
     global _CURRENT_THRESHOLD
-    _CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.56"))
+    _CURRENT_THRESHOLD = max(float(os.getenv("MIN_PROBABILITY", "0.62")), 0.30)
 
 
 def predict(symbol: str, row) -> Optional[Prediction]:
     if symbol not in ENSEMBLE_MODELS:
-        return Prediction(symbol=symbol, prob_long=0.28, direction=1, prob_win=0.28, flipped=False)
+        return Prediction(symbol=symbol, prob_long=0.25, direction=1, prob_win=0.25, flipped=False)
 
     cfg = MODEL_CONFIGS[symbol]
-    th = _CURRENT_THRESHOLD
+    th = max(_CURRENT_THRESHOLD, float(os.getenv("MIN_PROBABILITY", "0.62")))
     FEAT = cfg["features"]
 
     try:
@@ -59,14 +59,14 @@ def predict(symbol: str, row) -> Optional[Prediction]:
 
         # 趋势过滤器: ADX < 20 且 RSI在中间 → 震荡, 不出手
         if adx < 18 and 35 < rsi < 65:
-            return Prediction(symbol=symbol, prob_long=0.28, direction=1, prob_win=0.28, flipped=False)
+            return Prediction(symbol=symbol, prob_long=0.25, direction=1, prob_win=0.25, flipped=False)
 
         if prob_put >= th:
             return Prediction(symbol=symbol, prob_long=round(1-prob_put, 4), direction=2, prob_win=round(prob_put, 4), flipped=False)
         elif prob_call >= th:
             return Prediction(symbol=symbol, prob_long=round(prob_call, 4), direction=1, prob_win=round(prob_call, 4), flipped=False)
         else:
-            return Prediction(symbol=symbol, prob_long=0.28, direction=1, prob_win=0.28, flipped=False)
+            return Prediction(symbol=symbol, prob_long=0.25, direction=1, prob_win=0.25, flipped=False)
 
     except Exception:
-        return Prediction(symbol=symbol, prob_long=0.28, direction=1, prob_win=0.28, flipped=False)
+        return Prediction(symbol=symbol, prob_long=0.25, direction=1, prob_win=0.25, flipped=False)

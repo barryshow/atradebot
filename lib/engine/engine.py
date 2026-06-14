@@ -342,7 +342,7 @@ class TradingEngine:
 
         # 模型预测
         pred = predictor.predict(symbol, row)
-        if pred is None or pred.prob_win < 0.30:
+        if pred is None or pred.prob_win < config.MIN_PROBABILITY - 0.10:
             return
 
         # 风控门
