@@ -14,7 +14,7 @@ from .models import Prediction
 
 ENSEMBLE_MODELS = {}
 MODEL_CONFIGS = {}
-_CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.62"))  # 默认0.62
+_CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.62"))  # 统一阈值
 
 
 def load_models():
@@ -35,7 +35,8 @@ def load_models():
 
 def set_bootstrap_mode(enabled: bool = True, turbo: bool = True):
     global _CURRENT_THRESHOLD
-    _CURRENT_THRESHOLD = max(float(os.getenv("MIN_PROBABILITY", "0.62")), 0.30)
+    # bootstrap模式: 降低阈值让冷启动多出信号快速积累样本
+    _CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.62"))
 
 
 def predict(symbol: str, row) -> Optional[Prediction]:
@@ -43,7 +44,7 @@ def predict(symbol: str, row) -> Optional[Prediction]:
         return Prediction(symbol=symbol, prob_long=0.25, direction=1, prob_win=0.25, flipped=False)
 
     cfg = MODEL_CONFIGS[symbol]
-    th = max(_CURRENT_THRESHOLD, float(os.getenv("MIN_PROBABILITY", "0.62")))
+    th = _CURRENT_THRESHOLD
     FEAT = cfg["features"]
 
     try:
@@ -57,9 +58,9 @@ def predict(symbol: str, row) -> Optional[Prediction]:
         adx = float(row.get("ADX", 20))
         rsi = float(row.get("RSI", 50))
 
-        # 趋势过滤器: ADX < 20 且 RSI在中间 → 震荡, 不出手
+        # 趋势过滤器: ADX < 18 且 RSI在中间 → 震荡, 不出手
         if adx < 18 and 35 < rsi < 65:
-            return Prediction(symbol=symbol, prob_long=0.25, direction=1, prob_win=0.25, flipped=False)
+            return Prediction(symbol=symbol, prob_long=0.28, direction=1, prob_win=0.28, flipped=False)
 
         if prob_put >= th:
             return Prediction(symbol=symbol, prob_long=round(1-prob_put, 4), direction=2, prob_win=round(prob_put, 4), flipped=False)

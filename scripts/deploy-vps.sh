@@ -101,7 +101,7 @@ if [ ! -f ".env.local" ]; then
     echo "PYTHON_PATH=${APP_DIR}/.venv/bin/python3"
     echo "RADAR_CSV_PATH=${APP_DIR}/hibt_ticks.csv"
     echo "MODEL_DIR=${APP_DIR}/models"
-    echo "HOLD_MINUTES=5"
+    echo "HOLD_MINUTES=15"
     echo "MAX_CONCURRENT_TRADES=3"
     echo "EOF"
     echo "───────────────────────────────────────────────"
