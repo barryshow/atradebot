@@ -44,7 +44,6 @@ FEATURE_INTERVAL_MIN = int(os.getenv("FEATURE_INTERVAL_MIN", "15"))
 
 MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "999"))  # 不限制
 TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "120"))
-REJECT_COOLDOWN_SEC = int(os.getenv("REJECT_COOLDOWN_SEC", "30"))
 
 # --- 本金管理: 凯利滚仓 ---
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "14"))
@@ -69,6 +68,29 @@ BB_OSCILLATE_LONG = float(os.getenv("BB_OSCILLATE_LONG", "0.25"))
 BB_OSCILLATE_SHORT = float(os.getenv("BB_OSCILLATE_SHORT", "0.75"))
 MIN_PROBABILITY = float(os.getenv("MIN_PROBABILITY", "0.30"))
 
+# --- SignalValidator 配置 ---
+# L0: 防接刀（Anti-Knife Filter）
+ANTI_KNIFE_BARS = int(os.getenv("ANTI_KNIFE_BARS", "5"))           # 检测K线数
+ANTI_KNIFE_BODY_RATIO = float(os.getenv("ANTI_KNIFE_BODY_RATIO", "0.6"))  # 实体占比阈值
+ANTI_KNIFE_CCI = float(os.getenv("ANTI_KNIFE_CCI", "100"))         # CCI极端阈值
+
+# L1: 硬性概率门槛（被 predictor.py 的 0.62 覆盖，此处保留为冗余）
+HARD_PROB_THRESHOLD = float(os.getenv("HARD_PROB_THRESHOLD", "0.62"))
+
+# L2: 极值翻转概率重置
+REVERSAL_PROB = float(os.getenv("REVERSAL_PROB", "0.55"))          # 翻转后固定胜率
+
+# --- RiskManager 配置 ---
+# L3: 共振分门槛
+CONFLUENCE_MIN = float(os.getenv("CONFLUENCE_MIN", "0.65"))        # 从0.30提升到0.65
+
+# L4: 冷却
+REJECT_COOLDOWN_SEC = int(os.getenv("REJECT_COOLDOWN_SEC", "60"))  # 被拒后冷却
+SETTLEMENT_COOLDOWN_SEC = int(os.getenv("SETTLEMENT_COOLDOWN_SEC", "60"))  # 结算后额外冷却
+
+# L5: 加仓
+ADD_POSITION_MIN_ROI = float(os.getenv("ADD_POSITION_MIN_ROI", "0.005"))  # 加仓最小浮盈 0.5%
+
 # --- Circuit Breaker ---
 CONSECUTIVE_LOSS_PAUSE_SEC = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_SEC", "300"))
 CONSECUTIVE_LOSS_HALT = int(os.getenv("CONSECUTIVE_LOSS_HALT", "8"))
@@ -83,4 +105,3 @@ LOSE_STREAK_TRIGGER = int(os.getenv("LOSE_STREAK_TRIGGER", "2"))
 # --- Session ---
 ACTIVE_HOURS_START = int(os.getenv("ACTIVE_HOURS_START", "0"))
 ACTIVE_HOURS_END = int(os.getenv("ACTIVE_HOURS_END", "24"))
-CONFLUENCE_MIN = float(os.getenv("CONFLUENCE_MIN", "0.30"))

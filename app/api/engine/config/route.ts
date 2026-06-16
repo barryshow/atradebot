@@ -1,24 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export async function GET() {
-  // Return non-sensitive config
   return NextResponse.json({
+    // 交易基础
     symbols: (process.env.TRADE_SYMBOLS || "BTCUSDT,ETHUSDT,SOLUSDT").split(","),
-    holdMinutes: Number(process.env.HOLD_MINUTES) || 5,
-    maxConcurrentTrades: Number(process.env.MAX_CONCURRENT_TRADES) || 3,
-    tradeCooldownSec: Number(process.env.TRADE_COOLDOWN_SEC) || 180,
-    rejectCooldownSec: Number(process.env.REJECT_COOLDOWN_SEC) || 45,
-    minProbability: Number(process.env.MIN_PROBABILITY) || 0.556,
-    bbDeadZone: [Number(process.env.BB_DEAD_ZONE_LOW) || 0.4, Number(process.env.BB_DEAD_ZONE_HIGH) || 0.6],
-    adxOscillating: Number(process.env.ADX_OSCILLATING_THRESHOLD) || 35,
-    adxExtreme: Number(process.env.ADX_EXTREME_THRESHOLD) || 44,
-    bbExtremeHigh: Number(process.env.BB_EXTREME_HIGH) || 0.7,
-    bbExtremeLow: Number(process.env.BB_EXTREME_LOW) || 0.3,
+    holdMinutes: Number(process.env.HOLD_MINUTES) || 15,
+    betMin: Number(process.env.BET_MIN) || 3,
+
+    // L0: 防接刀
+    antiKnifeCci: Number(process.env.ANTI_KNIFE_CCI) || 100,
+    antiKnifeBodyRatio: Number(process.env.ANTI_KNIFE_BODY_RATIO) || 0.6,
+
+    // L1: 硬性概率门槛
+    hardProbThreshold: Number(process.env.HARD_PROB_THRESHOLD) || 0.62,
+
+    // L2: 极值翻转
+    bbExtremeHigh: Number(process.env.BB_EXTREME_HIGH) || 0.72,
+    bbExtremeLow: Number(process.env.BB_EXTREME_LOW) || 0.28,
+    reversalProb: Number(process.env.REVERSAL_PROB) || 0.55,
+
+    // L3: 共振分
+    confluenceMin: Number(process.env.CONFLUENCE_MIN) || 0.65,
+
+    // L4: 双重冷却
+    rejectCooldownSec: Number(process.env.REJECT_COOLDOWN_SEC) || 60,
+    settlementCooldownSec: Number(process.env.SETTLEMENT_COOLDOWN_SEC) || 60,
+
+    // L5: 加仓
+    addPositionMinRoi: Number(process.env.ADD_POSITION_MIN_ROI) || 0.005,
   });
 }
 
 export async function PUT(req: NextRequest) {
   const body = await req.json();
-  // In a full implementation, this would send config_update to the Python process
   return NextResponse.json({ ok: true, msg: "Config update received", config: body });
 }

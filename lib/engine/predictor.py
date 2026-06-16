@@ -14,7 +14,7 @@ from .models import Prediction
 
 ENSEMBLE_MODELS = {}
 MODEL_CONFIGS = {}
-_CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.62"))  # 统一阈值
+_CURRENT_THRESHOLD = config.HARD_PROB_THRESHOLD  # 统一阈值 (与SignalValidator一致)
 
 
 def load_models():
@@ -36,7 +36,7 @@ def load_models():
 def set_bootstrap_mode(enabled: bool = True, turbo: bool = True):
     global _CURRENT_THRESHOLD
     # bootstrap模式: 降低阈值让冷启动多出信号快速积累样本
-    _CURRENT_THRESHOLD = float(os.getenv("MIN_PROBABILITY", "0.62"))
+    _CURRENT_THRESHOLD = config.HARD_PROB_THRESHOLD
 
 
 def predict(symbol: str, row) -> Optional[Prediction]:

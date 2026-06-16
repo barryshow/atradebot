@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-ATradeBot 引擎 v2 — 尊重HIBT真实余额和结算
+ATradeBot 引擎 v3 — SignalValidator → RiskManager → OrderExecutor 流水线
 
 核心规则:
-  1. 下单前检查余额: bet * (持仓+1) <= 余额 × 0.9
-  2. 不下模拟单: 不下单就是不下单, 不虚构settle
-  3. 盈亏来自HIBT余额变化, 不来自CSV收盘价
-  4. 方向: 集成模型说啥就是啥, 不额外翻转
+  1. SignalValidator (L0-L2): 防接刀 → 概率门槛 → 极值翻转+概率重置
+  2. RiskManager (L3-L5): 共振分 → 双重冷却 → 持仓管理
+  3. OrderExecutor: 按 action 执行开仓/加仓/反手
+  4. 盈亏来自HIBT余额变化, 不来自CSV收盘价
 """
 import time
 import json
@@ -14,10 +14,11 @@ import sys
 import os
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
 from . import config
 from . import predictor
-from .risk_gates import run_risk_pipeline
+from .signal_validator import validate_signal
+from .risk_manager import manage_signal
+from .order_executor import OrderExecutor
 from .ai_judge import judge
 from .exchange import fetch_balance, place_order
 from .notifier import notify_trade, notify_result
@@ -92,6 +93,7 @@ def _calc_30m_features(data_feat: pd.DataFrame) -> dict | None:
 
 class TradingEngine:
     def __init__(self):
+        self.executor = OrderExecutor()
         self.reset_state()
 
     def reset_state(self):
@@ -99,7 +101,8 @@ class TradingEngine:
         self.running = False
         self.paused = False
         self.balance = 0.0
-        self.start_balance = 0.0  # 启动时的余额快照
+        self.start_balance = 0.0
+        # 旧版 active_trades 保留仅用于结算检测（余额变化法）
         self.active_trades: list[dict] = []
         self.last_trade_ts: dict[str, int] = {s: 0 for s in config.SYMBOLS}
         self.last_reject_ts: dict[str, int] = {s: 0 for s in config.SYMBOLS}
@@ -109,13 +112,13 @@ class TradingEngine:
         self.halted = False
         self.pause_until = 0
         self.bet_mode = "kelly"
-        # 已结算的盈亏
         self.total_pnl = 0.0
         self.total_wins = 0
         self.total_losses = 0
-        # 启动预热: 第一根K线不交易, 等下一根新K线
         self._warmup_done: dict[str, bool] = {s: False for s in config.SYMBOLS}
-        self._csv_last_mtime = 0.0  # CSV最后修改时间, 用于检测数据新鲜度
+        self._csv_last_mtime = 0.0
+        # 重建 executor（清空内部状态）
+        self.executor = OrderExecutor()
 
     def start(self):
         self.reset_state()
@@ -123,19 +126,21 @@ class TradingEngine:
         n = predictor.load_models()
         predictor.set_bootstrap_mode()
         emit("status", {"state": "running", "models_loaded": n})
-        # 从HIBT拿真实余额
         self.balance = fetch_balance()
         if self.balance < 0:
             self.balance = 0.0
         self.start_balance = self.balance
         emit("balance_update", {"balance": self.balance})
-        # 重置预热标记
         self._warmup_done = {s: False for s in config.SYMBOLS}
-        emit("log", {"msg": f"启动! 余额{self.balance:.2f}U | 凯利滚仓 | 阈值0.62 | K线检测:{config.CANDLE_INTERVAL_MIN}分 | 特征聚合:{config.FEATURE_INTERVAL_MIN}分 | 持仓:{config.HOLD_MINUTES}分 | 预热中: 等下一根新K线再开单"})
+        emit("log", {
+            "msg": f"启动! 余额{self.balance:.2f}U | 底仓3U | "
+                   f"防接刀|共振分≥{config.CONFLUENCE_MIN}|概率重置{config.REVERSAL_PROB}|"
+                   f"结算冷却{config.SETTLEMENT_COOLDOWN_SEC}s"
+        })
 
     def stop(self):
         self.running = False
-        self.paused = False  # 确保主循环能退出
+        self.paused = False
         emit("status", {"state": "stopped"})
 
     def pause(self):
@@ -151,21 +156,19 @@ class TradingEngine:
         emit("log", {"msg": "恢复运行"})
 
     def _can_trade(self, bet: int) -> bool:
-        """检查余额是否够下单, 防止余额不足还开单"""
         needed = bet * (len(self.active_trades) + 1)
-        return self.balance >= needed + 0.5  # 留0.5U余量
+        return self.balance >= needed + 0.5
 
     def _check_settlement(self):
         """
         通过HIBT余额变化来判断订单是否已结算。
-        对比 (当前余额 - 前次余额快照) 来判断盈亏, 赢和输都能正确检测。
+        结算后通知 OrderExecutor.on_settlement() 清理持仓并执行反向信号。
         """
         if not self.active_trades:
             return
 
         new_balance = fetch_balance()
         if new_balance < 0:
-            # HIBT接口故障, 无法结算判断
             return
 
         prev_balance = self.balance
@@ -175,23 +178,13 @@ class TradingEngine:
             t = self.active_trades[i]
             elapsed = time.time() * 1000 - t["start_ts"]
 
-            # 还没到到期时间, 跳过
             if elapsed < config.HOLD_MINUTES * 60000:
                 continue
 
-            # 到期了, 判断余额是否发生了变化
-            # 赢: 余额增加 (本金返还 + 盈利)
-            # 输: 余额减少 (本金亏掉, 无返还)
-            # 都没变化: 可能还没结算完, 继续等
-
             if not balance_changed:
-                # 余额没动, 还没结算完
                 continue
 
-            # 余额有变化, 判断盈亏
             pnl = new_balance - prev_balance
-            # 输单: 余额少了约 bet 的量
-            # 赢单: 余额多了约 bet * payout 的量
             is_win = pnl > 0
 
             if is_win:
@@ -211,6 +204,9 @@ class TradingEngine:
             emit("balance_update", {"balance": new_balance})
             emit("log", {"msg": f"结算 {t['symbol']}: {'赢' if is_win else '输'} {abs(pnl):.2f}U | 余额→{new_balance:.2f}U"})
 
+            # 关键: 通知 OrderExecutor 结算完成
+            self.executor.on_settlement(t["symbol"])
+
     def _record_result(self, is_win: bool):
         self.recent_results.append(is_win)
         if len(self.recent_results) > config.RECENT_WINDOW:
@@ -227,88 +223,28 @@ class TradingEngine:
                 self.pause_until = int(time.time() * 1000) + pause_ms
                 emit("log", {"msg": f"连亏{self.consecutive_losses}笔, 冷冻{pause_ms//1000}秒"})
 
-    def _get_bet(self) -> int:
-        """仓位管理三阶段:
-        阶段1(冷启动, <5笔): 保底下注3U, 专等积累足够数据
-        阶段2(连败保护, >=2连败): 锁死3U, 不亏本金
-        阶段3(凯利顺加仓, ≥5笔且连盈): 半凯利+连胜加成
-        -- 全程整数, 始终 ≥3U ≤50U
-        """
-        bet = config.BET_MIN  # 3U保底
-
-        recent = self.recent_results[-50:] or self.recent_results
-        total = len(recent)
-
-        if total < 5:
-            # 数据不够, 3U硬干, 积累样本
-            return bet
-
-        # 连胜/连败(从最近一次往前数)
-        consecutive_wins = 0
-        consecutive_losses = 0
-        for r in reversed(recent):
-            if r:
-                consecutive_wins += 1
-            else:
-                break
-        for r in reversed(recent):
-            if not r:
-                consecutive_losses += 1
-            else:
-                break
-
-        # 连败保护: 锁死3U
-        if consecutive_losses >= config.LOSE_STREAK_TRIGGER:
-            return bet
-
-        win_rate = sum(recent) / total
-
-        # 胜率不够55%不配谈凯利, 继续3U保本
-        if win_rate < 0.55:
-            return bet
-
-        # 半凯利计算
-        b = 0.80
-        kelly = max(0.0, (win_rate * b - (1 - win_rate)) / b) * config.KELLY_FRACTION
-
-        # 连胜加成: 2连胜1.5x, 3连胜以上再叠加1.2x
-        if consecutive_wins >= config.WIN_STREAK_TRIGGER:
-            kelly *= config.WIN_STREAK_BOOST
-            if consecutive_wins >= 3:
-                kelly *= 1.2
-
-        bet = int(self.balance * kelly)
-        bet = max(config.BET_MIN, min(config.BET_MAX, bet))
-        return bet
-
     def process_symbol(self, symbol: str, full_df: pd.DataFrame, current_ts: int):
-        # 风控检查
+        # ── 全局风控 ──
         if self.halted or current_ts < self.pause_until:
             return
         if not self.active_trades and current_ts < self.pause_until:
             return
-        bet = self._get_bet()
-        if not self._can_trade(bet):
-            return
-        # 不限单数, 只看余额够不够
-        # HIBT限制: 每个品种同一时间最多一单
-        if any(t["symbol"] == symbol for t in self.active_trades):
-            return
-        if symbol not in predictor.ENSEMBLE_MODELS:
-            return
-        if current_ts - self.last_trade_ts.get(symbol, 0) < config.TRADE_COOLDOWN_SEC * 1000:
-            return
-        if current_ts - self.last_reject_ts.get(symbol, 0) < config.REJECT_COOLDOWN_SEC * 1000:
+
+        # 余额检查
+        if not self._can_trade(config.BET_MIN):
             return
 
-        # 数据准备
+        # 品种模型检查
+        if symbol not in predictor.ENSEMBLE_MODELS:
+            return
+
+        # ── 数据准备（与原版一致） ──
         df_s = full_df[full_df["symbol"] == symbol].copy()
         if len(df_s) < 200:
             return
         df_s.set_index("datetime", inplace=True)
 
-        # --- 1分钟K线用于信号检测（每分钟检查新信号） ---
-        candle_min = config.CANDLE_INTERVAL_MIN  # 默认1
+        candle_min = config.CANDLE_INTERVAL_MIN
         detect_data = df_s.resample(f"{candle_min}min").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
@@ -318,7 +254,6 @@ class TradingEngine:
 
         current_bar_ts = detect_data.index[-1]
 
-        # 启动预热: 跳过当前这根已存在的K线, 等下一根新K线再交易
         if not self._warmup_done.get(symbol, False):
             self.last_signal_bar_ts[symbol] = current_bar_ts
             self._warmup_done[symbol] = True
@@ -328,8 +263,7 @@ class TradingEngine:
         if self.last_signal_bar_ts.get(symbol) == current_bar_ts:
             return
 
-        # --- 15分钟聚合用于特征计算（保持模型兼容） ---
-        feat_min = config.FEATURE_INTERVAL_MIN  # 默认15
+        feat_min = config.FEATURE_INTERVAL_MIN
         feature_data = df_s.resample(f"{feat_min}min").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
@@ -341,12 +275,12 @@ class TradingEngine:
         if row is None:
             return
 
-        # 模型预测
+        # ── 模型预测 ──
         pred = predictor.predict(symbol, row)
         if pred is None or pred.prob_win < 0.30:
             return
 
-        # 风控门
+        # ── 指标提取 ──
         indicators = {
             "ADX": float(row.get("ADX", 20)),
             "BB_Pos": float(row.get("BB_Pos", 0.5)),
@@ -357,56 +291,129 @@ class TradingEngine:
         }
         emit("features", {"symbol": symbol, "indicators": indicators})
 
-        gates, pred, c_score = run_risk_pipeline(pred, row, indicators)
-        for g in gates:
-            emit("risk_gate", {"symbol": symbol, "level": g.level, "name": g.name, "passed": g.passed, "reason": g.reason})
+        current_price = float(row.get("close", 0))
+
+        # ═══════════════════════════════════════
+        # 流水线第一站: SignalValidator (L0-L2)
+        # ═══════════════════════════════════════
+        existing_pos = self.executor.positions.get(symbol)
+        signal, val_gates = validate_signal(
+            symbol, pred, row, indicators,
+            current_price=current_price,
+            existing_position=existing_pos,
+        )
+
+        # 发送 L0-L2 门结果
+        for g in val_gates:
+            emit("risk_gate", {
+                "symbol": symbol, "level": g.level, "name": g.name,
+                "passed": g.passed, "reason": g.reason,
+            })
             if not g.passed:
+                self.executor.last_reject_ts[symbol] = current_ts
                 self.last_reject_ts[symbol] = current_ts
                 return
 
-        # 现在才发prediction(防止前端看到翻转前的方向)
+        if signal is None:
+            return
+
+        # ═══════════════════════════════════════
+        # 流水线第二站: RiskManager (L3-L5)
+        # ═══════════════════════════════════════
+        signal, mgmt_gates = manage_signal(
+            signal,
+            current_ts=current_ts,
+            last_reject_ts=self.executor.last_reject_ts,
+            last_settlement_ts=self.executor.last_settlement_ts,
+            existing_position=existing_pos,
+            current_price=current_price,
+        )
+
+        for g in mgmt_gates:
+            emit("risk_gate", {
+                "symbol": symbol, "level": g.level, "name": g.name,
+                "passed": g.passed, "reason": g.reason,
+            })
+            if not g.passed:
+                if g.level == 4 or g.name == "Reject Cooldown":
+                    self.executor.last_reject_ts[symbol] = current_ts
+                    self.last_reject_ts[symbol] = current_ts
+                return
+
+        if signal is None:
+            return
+
+        # 发送预测（让前端看到信号方向）
         emit("prediction", {
-            "symbol": symbol, "prob_long": pred.prob_long,
-            "direction": pred.direction, "prob_win": pred.prob_win,
+            "symbol": symbol,
+            "prob_long": 1 - signal.direction / 3.0,
+            "direction": signal.direction,
+            "prob_win": signal.prob_win,
+            "is_reversal": signal.is_reversal,
+        })
+        emit("tick", {
+            "symbol": symbol, "dir": signal.dir_str,
+            "ml_prob": signal.prob_win, "phase": "trade",
         })
 
-        dir_str = "做多(CALL)" if pred.direction == 1 else "做空(PUT)"
-        emit("tick", {"symbol": symbol, "dir": dir_str, "ml_prob": pred.prob_win, "phase": "trade"})
-
-        # AI仅展示
+        # AI仅展示（不否决）
         try:
-            approval, reason, _ = judge(symbol, pred.direction, pred.prob_win, indicators, pred.flipped, confluence=c_score)
+            approval, reason, _ = judge(
+                symbol, signal.direction, signal.prob_win,
+                indicators, signal.is_reversal,
+                confluence=signal.confluence,
+            )
         except Exception:
             approval, reason = 0.0, "AI不可用"
-        emit("risk_gate", {"symbol": symbol, "level": 3, "name": "AI分析", "passed": True, "reason": f"AI: {reason}"})
+        emit("risk_gate", {
+            "symbol": symbol, "level": 6, "name": "AI分析",
+            "passed": True, "reason": f"AI: {reason}",
+        })
 
-        # 在HIBT实盘下单
-        res = place_order(symbol, pred.direction, bet, config.HOLD_MINUTES)
-        self.last_trade_ts[symbol] = current_ts
-        self.last_signal_bar_ts[symbol] = current_bar_ts
+        # ═══════════════════════════════════════
+        # 流水线第三站: OrderExecutor
+        # ═══════════════════════════════════════
+        ok = self.executor.execute(signal, current_ts, current_bar_ts)
 
-        if res.ok:
-            pre_balance = self.balance
-            entry_price = float(row.get("close", 0))
+        if ok:
+            # 记录到旧的 active_trades 用于结算检测
             self.active_trades.append({
-                "symbol": symbol, "dir": pred.direction,
-                "start_ts": current_ts, "amount": bet,
-                "entry": entry_price, "pre_balance": pre_balance,
+                "symbol": symbol, "dir": signal.direction,
+                "start_ts": current_ts, "amount": config.BET_MIN,
+                "entry": current_price,
+                "pre_balance": self.balance,
             })
-            # 查HIBT余额更新
+            self.last_trade_ts[symbol] = current_ts
+            self.last_signal_bar_ts[symbol] = current_bar_ts
+
+            # 查余额
             self.balance = fetch_balance()
             if self.balance < 0:
-                self.balance = pre_balance - bet
+                self.balance = self.balance - config.BET_MIN
+
             emit("trade_executed", {
-                "symbol": symbol, "direction": dir_str,
-                "entryPrice": entry_price, "amount": bet,
-                "mlProb": pred.prob_win, "balance": self.balance,
-                "confluence": c_score, "flipped": pred.flipped,
+                "symbol": symbol, "direction": signal.dir_str,
+                "entryPrice": current_price, "amount": config.BET_MIN,
+                "mlProb": signal.prob_win, "balance": self.balance,
+                "confluence": signal.confluence,
+                "flipped": signal.is_reversal,
+                "action": signal.action,
             })
-            notify_trade(symbol, dir_str, entry_price, bet, pred.prob_win, indicators, reason, self.balance, len(self.active_trades), pred.flipped)
+            notify_trade(
+                symbol, signal.dir_str, current_price, config.BET_MIN,
+                signal.prob_win, indicators, reason, self.balance,
+                len(self.active_trades), signal.is_reversal,
+            )
             emit("balance_update", {"balance": self.balance})
+
+            # 如果 action=close_and_open 且下单的是反向开仓:
+            # 但 close_and_open 被设计为: 先标记 pending_close, 等结算后再开反向
+            # 此时 execute() 不会立即下单，所以不应记录到 active_trades
+            if signal.action == "close_and_open":
+                # 回滚刚才的记录（实际未下单）
+                self.active_trades.pop()
         else:
-            emit("log", {"msg": f"拒单 {symbol}: {res.msg}"})
+            emit("log", {"msg": f"拒单 {symbol}"})
 
     def tick(self):
         current_ts = int(time.time() * 1000)
@@ -414,7 +421,6 @@ class TradingEngine:
             return
 
         try:
-            # 先查结算
             self._check_settlement()
 
             full_df = pd.read_csv(config.CSV_FILE, engine="python", on_bad_lines="skip")
@@ -429,7 +435,6 @@ class TradingEngine:
             if len(full_df) < 50:
                 return
 
-            # 推K线到前端
             for s in config.SYMBOLS:
                 ds = full_df[full_df["symbol"] == s]
                 if not ds.empty:
@@ -441,7 +446,6 @@ class TradingEngine:
                         "volume": float(last["volume"]) if len(last) > 6 else 0,
                     })
 
-            # 检查信号
             for s in config.SYMBOLS:
                 self.process_symbol(s, full_df, current_ts)
 
@@ -451,7 +455,11 @@ class TradingEngine:
     def get_status(self) -> dict:
         total = self.total_wins + self.total_losses
         wr = f"{(self.total_wins / total * 100):.1f}%" if total > 0 else "0.0%"
-        state = "halted" if self.halted else ("paused" if self.paused else ("running" if self.running else "stopped"))
+        state = "halted" if self.halted else (
+            "paused" if self.paused else (
+                "running" if self.running else "stopped"
+            )
+        )
         if self.pause_until > int(time.time() * 1000):
             state = "cooling"
         profit = self.balance - self.start_balance if self.start_balance > 0 else 0
@@ -461,6 +469,7 @@ class TradingEngine:
             "winRate": wr, "activeTrades": len(self.active_trades),
             "maxConcurrentTrades": 999,
             "consecutiveLosses": self.consecutive_losses,
-            "currentBet": self._get_bet(), "betMode": self.bet_mode,
+            "currentBet": config.BET_MIN,
+            "betMode": "fixed_3u",
             "profit": round(profit, 2),
         }

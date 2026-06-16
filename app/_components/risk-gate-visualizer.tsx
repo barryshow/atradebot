@@ -7,12 +7,15 @@ interface GateNode {
   icon: string;
 }
 
-// 实际使用的风控门（不再显示已移除的死区/震荡门）
+// 新流水线的7道门 (SignalValidator L0-L2, RiskManager L3-L5, AI)
 const GATE_NODES: GateNode[] = [
-  { level: 1, name: "ML概率(0.30)", icon: "🧠" },
-  { level: 2, name: "极值翻转", icon: "🔄" },
-  { level: 2, name: "共振参考", icon: "📊" },
-  { level: 3, name: "AI分析(仅展示)", icon: "🤖" },
+  { level: 0, name: "防接刀", icon: "🔪" },
+  { level: 1, name: "ML概率(0.62)", icon: "🧠" },
+  { level: 2, name: "极值翻转(0.55)", icon: "🔄" },
+  { level: 3, name: "共振分(>=0.65)", icon: "📊" },
+  { level: 4, name: "双重冷却", icon: "⏳" },
+  { level: 5, name: "持仓管理", icon: "📋" },
+  { level: 6, name: "AI分析(仅展示)", icon: "🤖" },
 ];
 
 function getGateStatus(
@@ -21,8 +24,8 @@ function getGateStatus(
 ): "idle" | "pass" | "fail" | "flip" {
   const match = gates.filter((g) => g.level === node.level);
   if (match.length === 0) return "idle";
-  if (node.name.includes("极值翻转")) {
-    const flipped = match.some((g) => g.reason?.includes("翻转") || g.name.includes("flip"));
+  if (node.level === 2 && node.name.includes("极值翻转")) {
+    const flipped = match.some((g) => g.reason?.includes("Reversal") || g.name.includes("翻转"));
     return flipped ? "flip" : "pass";
   }
   const last = match[match.length - 1];
