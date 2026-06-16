@@ -16,6 +16,7 @@ export class ProcessManager extends EventEmitter {
   private activeTrades = 0;
   private restartCount = 0;
   private maxRestarts = 3;
+  private _stopping = false;
 
   getState(): EngineStatus {
     return {
@@ -33,8 +34,11 @@ export class ProcessManager extends EventEmitter {
   }
 
   async start(): Promise<{ ok: boolean; error?: string }> {
-    if (this.process && this.state !== "stopped") {
-      return { ok: false, error: `Already ${this.state}` };
+    if (this.process) {
+      return { ok: false, error: `Process already exists (state=${this.state})` };
+    }
+    if (this._stopping) {
+      return { ok: false, error: "Process is being stopped, wait for it to fully exit" };
     }
 
     let pythonPath = process.env.PYTHON_PATH;
@@ -79,12 +83,14 @@ export class ProcessManager extends EventEmitter {
         this.process = null;
         this.emitState();
 
-        // Auto-restart on unexpected exit
-        if (code !== 0 && this.restartCount < this.maxRestarts) {
+        // Auto-restart on unexpected exit (not user-initiated stop)
+        if (!this._stopping && code !== 0 && this.restartCount < this.maxRestarts) {
           this.restartCount++;
           const delay = Math.min(2000 * this.restartCount, 10000);
           logStore.add(`[process] Auto-restart in ${delay}ms (attempt ${this.restartCount})`);
           setTimeout(() => this.start(), delay);
+        } else {
+          this._stopping = false;
         }
       });
 
@@ -107,22 +113,49 @@ export class ProcessManager extends EventEmitter {
 
   async stop(): Promise<{ ok: boolean }> {
     if (!this.process) {
+      this.state = "stopped";
+      this._stopping = false;
+      this.emitState();
       return { ok: true };
     }
+    if (this._stopping) {
+      logStore.add("[process] Already stopping, waiting...");
+      return { ok: true };
+    }
+    this._stopping = true;
+    this.state = "stopped";
+    this.emitState();
     this.sendCommand("stop");
+
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        this.process?.kill("SIGKILL");
+        try {
+          this.process?.kill("SIGKILL");
+        } catch { /* process already dead */ }
+        this.process = null;
+        this._stopping = false;
+        this.emitState();
+        logStore.add("[process] Stopped via SIGKILL (timeout)");
         resolve({ ok: true });
       }, 5000);
 
-      this.process!.on("exit", () => {
+      const proc = this.process!;
+      const cleanup = () => {
         clearTimeout(timeout);
         this.state = "stopped";
         this.process = null;
+        this._stopping = false;
         this.emitState();
+        logStore.add("[process] Stopped cleanly");
         resolve({ ok: true });
-      });
+      };
+
+      // If exit already fired between the check above and now
+      if (!proc.killed && proc.exitCode === null) {
+        proc.once("exit", cleanup);
+      } else {
+        cleanup();
+      }
     });
   }
 
@@ -139,9 +172,17 @@ export class ProcessManager extends EventEmitter {
   }
 
   private sendCommand(command: string, args?: Record<string, unknown>) {
-    if (!this.process?.stdin?.writable) return;
+    if (!this.process?.stdin?.writable) {
+      logStore.add(`[process] Cannot send command "${command}": stdin not writable`);
+      return;
+    }
     const cmd = JSON.stringify({ command, ...args });
-    this.process.stdin.write(cmd + "\n");
+    try {
+      this.process.stdin.write(cmd + "\n", "utf-8");
+      logStore.add(`[process] Sent command: ${command}`);
+    } catch (err) {
+      logStore.add(`[process] Failed to send command "${command}": ${err}`);
+    }
   }
 
   private handleEvent(event: EngineEvent) {

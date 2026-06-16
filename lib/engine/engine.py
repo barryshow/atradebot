@@ -135,6 +135,7 @@ class TradingEngine:
 
     def stop(self):
         self.running = False
+        self.paused = False  # 确保主循环能退出
         emit("status", {"state": "stopped"})
 
     def pause(self):

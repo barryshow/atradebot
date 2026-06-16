@@ -72,7 +72,7 @@ def main():
 
     # Main loop
     last_balance_check = time.time()
-    while True:
+    while engine.running or engine.paused:
         if engine.running and not engine.paused:
             try:
                 engine.tick()
@@ -94,6 +94,9 @@ def main():
         # Emit status heartbeat
         emit("status", engine.get_status())
         time.sleep(2)
+
+    # Clean exit
+    emit("status", {"state": "stopped", "msg": "Engine process exiting"})
 
 
 if __name__ == "__main__":
