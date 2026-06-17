@@ -392,7 +392,7 @@ class TradingEngine:
                 self.balance = self.balance - config.BET_MIN
 
             emit("trade_executed", {
-                "symbol": symbol, "direction": signal.dir_str,
+                "symbol": symbol, "direction": "CALL" if signal.direction == 1 else "PUT",
                 "entryPrice": current_price, "amount": config.BET_MIN,
                 "mlProb": signal.prob_win, "balance": self.balance,
                 "confluence": signal.confluence,
