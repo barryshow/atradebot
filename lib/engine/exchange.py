@@ -127,13 +127,13 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
         else:
             return OrderResult(ok=False, code=-1, msg="模拟网络波动拒单")
 
-    # HIBT API direction 映射（已验证通过）:
-    #   direction=1 (CALL/做多) → HIBT API direction=-1
-    #   direction=2 (PUT/做空) → HIBT API direction=1
-    direction_map = {1: -1, 2: 1}
+    # HIBT API direction（实测）:
+    #   direction=1 (CALL/做多) → API传1 (HIBT 多)
+    #   direction=2 (PUT/做空) → API传-1 (HIBT 空)
+    hibt_dir = 1 if direction == 1 else -1
     data = {
         "amount": str(amount),
-        "direction": str(direction_map.get(direction, direction)),
+        "direction": str(hibt_dir),
         "symbol": symbol.lower().replace("usdt", "_usdt"),
         "timeUnit": str(hold_minutes),
         "langCode": "zh_CN",
