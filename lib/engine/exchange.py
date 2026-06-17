@@ -127,15 +127,9 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
         else:
             return OrderResult(ok=False, code=-1, msg="模拟网络波动拒单")
 
-    # FIX: HIBT platform API - verify direction mapping
-    # direction=1 (CALL/做多) should send 1, direction=2 (PUT/做空) should send -1
-    # Based on user feedback that calls were going through as puts and vice versa
-    # HIBT might have reversed convention vs internal model
-    hibt_direction = -1 if direction == 1 else 1
-
     data = {
         "amount": str(amount),
-        "direction": str(htib_direction),
+        "direction": str(1 if direction == 1 else -1),
         "symbol": symbol.lower().replace("usdt", "_usdt"),
         "timeUnit": str(hold_minutes),
         "langCode": "zh_CN",
