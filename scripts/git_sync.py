@@ -65,7 +65,9 @@ def main():
         print("没有新的本地修改")
         # 检查是否有未推送的 commit
         r = local_run("git log origin/main..HEAD --oneline", capture=True)
-        if not r.stdout.strip():
+        if r.stdout and r.stdout.strip():
+            print(f"发现未推送的提交: {r.stdout.strip()}")
+        else:
             print("本地和远程一致，无需推送")
 
     # push
