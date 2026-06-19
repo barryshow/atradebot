@@ -326,7 +326,6 @@ class TradingEngine:
             last_reject_ts=self.executor.last_reject_ts,
             last_settlement_ts=self.executor.last_settlement_ts,
             existing_position=existing_pos,
-            current_price=current_price,
         )
 
         for g in mgmt_gates:

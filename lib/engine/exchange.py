@@ -139,6 +139,7 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
         "langCode": "zh_CN",
     }
     headers = _headers()
+    last_err = ""
     for ep in ENDPOINTS:
         try:
             res = curl_requests.post(
@@ -149,7 +150,10 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
             rj = res.json()
             if rj.get("code") in [0, 200, "0", "200"]:
                 return OrderResult(ok=True, code=200, msg="下单成功")
+            # API明确拒绝 → 直接返回失败（不要换 endpoint 重试，防止重复下单）
             return OrderResult(ok=False, code=rj.get("code"), msg=rj.get("msg", res.text[:30]))
-        except Exception:
+        except Exception as e:
+            last_err = str(e)[:50]
             continue
-    return OrderResult(ok=False, msg="所有接口请求均崩溃")
+    # 所有 endpoint 都网络超时/出错，才返回失败（宁可漏单，不可重复下单）
+    return OrderResult(ok=False, msg=f"网络错误: {last_err}")

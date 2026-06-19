@@ -2,16 +2,16 @@
 """
 OrderExecutor — 订单执行器（流水线末端）
 
+HIBT 二元期权模式：每单独立结算，不追仓不加仓。
+
 职责:
 1. 根据 TradeSignal.action 执行操作：
    - "open" → 调 place_order 开底仓 (3U)
-   - "add"  → 调 place_order 加仓 (3U)
    - "close_and_open" → 标记 pending_close，等待结算后开反向仓
    - "close" → 仅标记 pending_close（被动等待结算）
 
 2. 维护 PositionBook（品种持仓账簿）
    - 每个品种跟踪 direction, entry_price, amount, open_time
-   - 浮盈计算
    - pending_close 状态管理
 
 3. 重要限制:
@@ -39,28 +39,18 @@ class PositionBook:
         return symbol in self._positions
 
     def open_position(self, signal: TradeSignal, current_ts: int, entry_bar_ts):
-        """开仓（或加仓）"""
-        existing = self._positions.get(signal.symbol)
-        if existing and existing.direction == signal.direction:
-            # 加仓：累积投入金额
-            existing.amount += config.BET_MIN
-            # 加权平均持仓价
-            total = existing.amount
-            existing.entry_price = (
-                existing.entry_price * (existing.amount - config.BET_MIN) / total
-                + signal.entry_price * config.BET_MIN / total
-            )
-            existing.open_time_ms = current_ts
-            existing.pending_close = False
-        else:
-            self._positions[signal.symbol] = PositionState(
-                symbol=signal.symbol,
-                direction=signal.direction,
-                amount=config.BET_MIN,
-                entry_price=signal.entry_price,
-                open_time_ms=current_ts,
-                entry_bar_ts=entry_bar_ts,
-            )
+        """开仓（首次开仓或结算后反向开仓）
+
+        HIBT 二元期权每单独立，不做加仓/加权。有持仓则覆盖（先结算后反向开仓时用）。
+        """
+        self._positions[signal.symbol] = PositionState(
+            symbol=signal.symbol,
+            direction=signal.direction,
+            amount=config.BET_MIN,
+            entry_price=signal.entry_price,
+            open_time_ms=current_ts,
+            entry_bar_ts=entry_bar_ts,
+        )
 
     def mark_pending_close(self, symbol: str):
         """标记品种为等待平仓状态"""
@@ -107,6 +97,8 @@ class OrderExecutor:
         # 品种冷却跟踪
         self.last_settlement_ts: dict[str, int] = {s: 0 for s in config.SYMBOLS}
         self.last_reject_ts: dict[str, int] = {s: 0 for s in config.SYMBOLS}
+        # 下单去重：记录每个品种最后一次成功下单的时间戳 + 方向
+        self._last_order_key: dict[str, tuple[int, int]] = {}  # symbol -> (ts_ms, direction)
 
     def execute(self, signal: TradeSignal, current_ts: int, entry_bar_ts) -> bool:
         """
@@ -118,9 +110,6 @@ class OrderExecutor:
 
         if action == "open":
             return self._open_position(signal, current_ts, entry_bar_ts)
-
-        elif action == "add":
-            return self._add_position(signal, current_ts, entry_bar_ts)
 
         elif action == "close_and_open":
             # 标记 pending_close → 等待结算 → 结算后自动执行反向开仓
@@ -136,8 +125,18 @@ class OrderExecutor:
         return False
 
     def _place(self, signal: TradeSignal, amount: float) -> bool:
-        """统一下单接口"""
+        """统一下单接口（含去重：同一品种同一方向 15 秒内不重复下单）"""
+        now = int(time.time() * 1000)
+        key = (signal.symbol, signal.direction)
+        last = self._last_order_key.get(signal.symbol)
+        if last is not None:
+            last_ts, last_dir = last
+            if last_dir == signal.direction and (now - last_ts) < 15000:
+                return False  # 15秒内同一品种同一方向去重
+
         result = place_order(signal.symbol, signal.direction, amount, config.HOLD_MINUTES)
+        if result.ok:
+            self._last_order_key[signal.symbol] = (now, signal.direction)
         return result.ok
 
     def _open_position(self, signal: TradeSignal, current_ts: int, entry_bar_ts) -> bool:
@@ -146,13 +145,6 @@ class OrderExecutor:
             # 安全保护：不应该发生
             return False
 
-        ok = self._place(signal, config.BET_MIN)
-        if ok:
-            self.positions.open_position(signal, current_ts, entry_bar_ts)
-        return ok
-
-    def _add_position(self, signal: TradeSignal, current_ts: int, entry_bar_ts) -> bool:
-        """加仓（追加 3U）"""
         ok = self._place(signal, config.BET_MIN)
         if ok:
             self.positions.open_position(signal, current_ts, entry_bar_ts)

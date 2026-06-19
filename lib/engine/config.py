@@ -88,8 +88,7 @@ CONFLUENCE_MIN = float(os.getenv("CONFLUENCE_MIN", "0.65"))        # 从0.30提�
 REJECT_COOLDOWN_SEC = int(os.getenv("REJECT_COOLDOWN_SEC", "60"))  # 被拒后冷却
 SETTLEMENT_COOLDOWN_SEC = int(os.getenv("SETTLEMENT_COOLDOWN_SEC", "60"))  # 结算后额外冷却
 
-# L5: 加仓
-ADD_POSITION_MIN_ROI = float(os.getenv("ADD_POSITION_MIN_ROI", "0.005"))  # 加仓最小浮盈 0.5%
+# L5: 加仓（已移除 — 二元期权每单独立，不做加仓）
 
 # --- Circuit Breaker ---
 CONSECUTIVE_LOSS_PAUSE_SEC = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_SEC", "300"))

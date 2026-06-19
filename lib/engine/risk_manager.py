@@ -4,7 +4,7 @@ RiskManager — 风险管理器（流水线 L3~L5）
 
 L3: 共振分门槛 (≥0.65)
 L4: 双重冷却 (Reject Cooldown 60s + Settlement Cooldown 60s)
-L5: 持仓检查 + 加仓/反手逻辑
+L5: 持仓检查（开仓/反手/跳过，无加仓）
 
 输入: TradeSignal (已通过 SignalValidator)
 输出: TradeSignal | None (None 表示拦截)
@@ -97,31 +97,32 @@ def _check_cooldown(
 
 
 # ──────────────────────────────────────────────
-# L5: 持仓检查 + 加仓/反手
+# L5: 持仓检查（简化版—去掉加仓）
 # ──────────────────────────────────────────────
 
 def _check_position_management(
     signal: TradeSignal,
     position: PositionState | None,
-    current_price: float,
 ) -> tuple[GateResult, str]:
     """
-    同品种持仓状态机:
+    同品种持仓状态机（简化版）：
+
+    HIBT 二元期权每单独立结算，持仓期间不应"加仓"。
+    每笔交易独立决策，等结算后再重新评估。
 
     状态1: 无持仓 → action="open"（正常开底仓）
-    状态2: 同向信号 + 浮盈 → action="add"（加仓）
-    状态3: 同向信号 + 亏损 → 拦截 (No Martingale)
-    状态4: 反向信号 → action="close_and_open"（平仓→重置→独立评估）
-    状态5: pending_close 状态 → 拦截（等结算完成）
+    状态2: 有持仓 + 同向信号 → 跳过（等结算，不追仓）
+    状态3: 有持仓 + 反向信号 → action="close_and_open"（标记平仓，结算后自动开反向仓）
+    状态4: pending_close → 跳过（等结算完成）
     """
     if position is None:
-        # 无持仓：正常开底仓
         return (
-            GateResult(level=5, name="Position Mgmt", passed=True, reason="no position → open"),
+            GateResult(level=5, name="Position Mgmt", passed=True,
+                       reason="no position → open"),
             "open",
         )
 
-    # 有持仓但 pending_close — 等待结算完成
+    # pending_close — 等结算
     if position.pending_close:
         return (
             GateResult(level=5, name="Position Mgmt", passed=False,
@@ -129,33 +130,21 @@ def _check_position_management(
             "pending",
         )
 
+    # 有持仓 — 检查方向
     is_same_direction = position.direction == signal.direction
 
     if is_same_direction:
-        # 同向信号
-        # 计算未实现盈亏
-        if signal.direction == 1:
-            roi = (current_price - position.entry_price) / position.entry_price
-        else:
-            roi = (position.entry_price - current_price) / position.entry_price
-
-        if roi >= config.ADD_POSITION_MIN_ROI:
-            return (
-                GateResult(level=5, name="Position Mgmt", passed=True,
-                           reason=f"add position (roi={roi:.4f})"),
-                "add",
-            )
-        else:
-            return (
-                GateResult(level=5, name="Position Mgmt", passed=False,
-                           reason=f"No Martingale - position in loss (roi={roi:.4f})"),
-                "pending",
-            )
+        # 同向：跳过，等结算后再决策（不再加仓）
+        return (
+            GateResult(level=5, name="Position Mgmt", passed=False,
+                       reason="same direction, skip — wait settlement (no add)"),
+            "pending",
+        )
     else:
-        # 反向信号 → 触发平仓反手
+        # 反向：平仓反手
         return (
             GateResult(level=5, name="Position Mgmt", passed=True,
-                       reason=f"reverse signal → close existing + open new"),
+                       reason="reverse signal → close existing + open new"),
             "close_and_open",
         )
 
@@ -170,7 +159,6 @@ def manage_signal(
     last_reject_ts: dict[str, int],
     last_settlement_ts: dict[str, int],
     existing_position: PositionState | None,
-    current_price: float,
 ) -> tuple[TradeSignal | None, list[GateResult]]:
     """
     通过 L3~L5 风控管道管理信号。
@@ -194,7 +182,7 @@ def manage_signal(
         return None, gates
 
     # ── L5: 持仓管理 ──
-    g5, action = _check_position_management(signal, existing_position, current_price)
+    g5, action = _check_position_management(signal, existing_position)
     signal.action = action
     gates.append(g5)
     if not g5.passed:

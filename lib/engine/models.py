@@ -31,7 +31,7 @@ class TradeSignal:
     prob_win: float         # 可能是模型原始胜率，也可能是翻转后重置的0.55
     original_prob: float    # 模型原始胜率（用于日志对比）
     is_reversal: bool       # 是否经过了极值翻转
-    action: str             # "open" | "add" | "close_and_open" | "close"
+    action: str             # "open" | "close_and_open" | "close" (add removed — 二元期权每单独立)
     entry_price: float      # 当前价格
     indicators: dict        # 指标快照
     confluence: float       # 共振分

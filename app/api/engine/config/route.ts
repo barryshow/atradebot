@@ -26,8 +26,8 @@ export async function GET() {
     rejectCooldownSec: Number(process.env.REJECT_COOLDOWN_SEC) || 60,
     settlementCooldownSec: Number(process.env.SETTLEMENT_COOLDOWN_SEC) || 60,
 
-    // L5: 加仓
-    addPositionMinRoi: Number(process.env.ADD_POSITION_MIN_ROI) || 0.005,
+    // L5: 加仓（已移除 — 二元期权每单独立，不做加仓）
+    // addPositionMinRoi removed
   });
 }
 
