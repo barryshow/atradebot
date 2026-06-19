@@ -14,8 +14,6 @@ export class ProcessManager extends EventEmitter {
   private losses = 0;
   private balance = 0;
   private activeTrades = 0;
-  private restartCount = 0;
-  private maxRestarts = 3;
   private _stopping = false;
 
   getState(): EngineStatus {
@@ -81,17 +79,8 @@ export class ProcessManager extends EventEmitter {
         logStore.add(`[process] Python exited with code ${code}`);
         this.state = "stopped";
         this.process = null;
+        this._stopping = false;
         this.emitState();
-
-        // Auto-restart on unexpected exit (not user-initiated stop)
-        if (!this._stopping && code !== 0 && this.restartCount < this.maxRestarts) {
-          this.restartCount++;
-          const delay = Math.min(2000 * this.restartCount, 10000);
-          logStore.add(`[process] Auto-restart in ${delay}ms (attempt ${this.restartCount})`);
-          setTimeout(() => this.start(), delay);
-        } else {
-          this._stopping = false;
-        }
       });
 
       this.process.on("error", (err) => {
@@ -102,7 +91,6 @@ export class ProcessManager extends EventEmitter {
 
       // Send start command
       setTimeout(() => this.sendCommand("start"), 500);
-      this.restartCount = 0;
       return { ok: true };
     } catch (err) {
       this.state = "error";

@@ -2,6 +2,8 @@
 """
 Entry point: spawned by Next.js ProcessManager.
 Communicates via stdout JSON lines, reads commands from stdin.
+
+PID lock: ensures only one instance runs at a time regardless of how it's started.
 """
 import sys
 import io
@@ -10,6 +12,43 @@ import time
 import threading
 import os
 import warnings
+import signal
+import atexit
+
+# ── PID lock ──────────────────────────────────────────────────────────
+PID_FILE = "/tmp/atradebot_engine.pid"
+
+def _acquire_pid_lock() -> bool:
+    """Write PID file with flock semantics. Returns False if another instance is running."""
+    try:
+        # Check existing PID
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                old_pid = int(f.read().strip())
+            try:
+                os.kill(old_pid, 0)  # Signal 0 = test if alive
+                print(f"[PID Lock] Another engine already running (pid={old_pid}), exiting.", flush=True)
+                return False
+            except (OSError, ProcessLookupError):
+                pass  # Stale PID file
+            os.remove(PID_FILE)
+
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"[PID Lock] Warning: could not write PID file: {e}", flush=True)
+    return True
+
+def _release_pid_lock():
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(PID_FILE)
+    except Exception:
+        pass
+
+# ──────────────────────────────────────────────────────────────────────
 
 # Force UTF-8
 if sys.stdout.encoding != "utf-8":
@@ -60,17 +99,22 @@ def stdin_reader(engine: TradingEngine):
 
 
 def main():
+    # ── PID lock ────────────────────────────────────────────
+    if not _acquire_pid_lock():
+        sys.exit(1)
+    atexit.register(_release_pid_lock)
+    # ────────────────────────────────────────────────────────
+
     engine = TradingEngine()
 
-    # Start stdin command reader in background
+    # Start stdin command reader in background (waits for frontend commands)
     reader = threading.Thread(target=stdin_reader, args=(engine,), daemon=True)
     reader.start()
 
-    # Auto-start immediately
-    engine.start()
-    emit("status", {"state": "running", "msg": "Engine auto-started"})
+    # Emit initial idle state — engine is alive but waiting for frontend "start"
+    emit("status", {"state": "stopped", "msg": "Engine ready, waiting for frontend start command"})
 
-    # Main loop
+    # Main loop — ticks only when engine.running is True
     last_balance_check = time.time()
     while engine.running or engine.paused:
         if engine.running and not engine.paused:

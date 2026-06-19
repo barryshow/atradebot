@@ -117,18 +117,11 @@ def main():
     time.sleep(2)
     vps_run(ssh, "pm2 status atradebot", timeout=10)
 
-    # 2e. 重启 Python 引擎
-    print("\n--- 重启 Python 引擎 ---")
+    # 2e. 杀掉旧的 Python 引擎（前端控制启动）
+    print("\n--- 杀掉旧的 Python 引擎（前端控制启动）---")
     vps_run(ssh, "pkill -f 'lib/engine/main.py' 2>/dev/null; sleep 2", timeout=10)
-    vps_run(ssh,
-        f"cd {REMOTE_DIR} && mkdir -p logs && nohup python3 -u lib/engine/main.py > logs/engine.log 2>&1 &",
-        timeout=5)
-    time.sleep(5)
-    out, _, _ = vps_run(ssh, "pgrep -af 'lib/engine/main.py' || echo '⚠ 引擎未运行'", timeout=5)
-    if "main.py" in out:
-        print("✅ Python 引擎已启动")
-    else:
-        print("⚠ Python 引擎可能未启动，请检查 VPS 日志")
+    out, _, _ = vps_run(ssh, "pgrep -af 'lib/engine/main.py' || echo '引擎已停止'", timeout=5)
+    print("✅ 旧引擎已清理，通过前端 API 启动引擎")
 
     # 2f. 健康检查
     out, _, _ = vps_run(ssh, "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/health 2>&1", timeout=10)
