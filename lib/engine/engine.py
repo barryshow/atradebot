@@ -161,30 +161,28 @@ class TradingEngine:
 
     def _check_settlement(self):
         """
-        通过HIBT余额变化来判断订单是否已结算。
+        通过时间推算判断订单是否已结算（HIBT 二元期权固定到期时间）。
+        不再依赖余额变化法（余额会被主循环刷新导致结算判断永久失败）。
         结算后通知 OrderExecutor.on_settlement() 清理持仓并执行反向信号。
         """
         if not self.active_trades:
             return
 
-        new_balance = fetch_balance()
-        if new_balance < 0:
+        current_balance = fetch_balance()
+        if current_balance < 0:
             return
-
-        prev_balance = self.balance
-        balance_changed = abs(new_balance - prev_balance) > 0.005
 
         for i in range(len(self.active_trades) - 1, -1, -1):
             t = self.active_trades[i]
-            elapsed = time.time() * 1000 - t["start_ts"]
+            elapsed_ms = time.time() * 1000 - t["start_ts"]
+            # HIBT 到期后额外给 30 秒缓冲（网络延迟、API 同步延迟）
+            settle_threshold_ms = config.HOLD_MINUTES * 60000 + 30000
 
-            if elapsed < config.HOLD_MINUTES * 60000:
+            if elapsed_ms < settle_threshold_ms:
                 continue
 
-            if not balance_changed:
-                continue
-
-            pnl = new_balance - prev_balance
+            # 用当前余额减下单前余额估算盈亏
+            pnl = current_balance - t["pre_balance"]
             is_win = pnl > 0
 
             if is_win:
@@ -200,9 +198,9 @@ class TradingEngine:
             })
             notify_result(t["symbol"], is_win, pnl)
             self.active_trades.pop(i)
-            self.balance = new_balance
-            emit("balance_update", {"balance": new_balance})
-            emit("log", {"msg": f"结算 {t['symbol']}: {'赢' if is_win else '输'} {abs(pnl):.2f}U | 余额→{new_balance:.2f}U"})
+            self.balance = current_balance
+            emit("balance_update", {"balance": current_balance})
+            emit("log", {"msg": f"结算 {t['symbol']}: {'赢' if is_win else '输'} {abs(pnl):.2f}U | 余额→{current_balance:.2f}U"})
 
             # 关键: 通知 OrderExecutor 结算完成
             self.executor.on_settlement(t["symbol"])
