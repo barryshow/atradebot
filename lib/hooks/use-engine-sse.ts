@@ -6,6 +6,9 @@ import type {
   SymbolSnapshot,
   TradeRecord,
   RiskGateResult,
+  MarketRegimeType,
+  EdgeResult,
+  RejectReasonCode,
 } from "@/lib/types/engine";
 
 interface State {
@@ -15,6 +18,15 @@ interface State {
   recentTrades: TradeRecord[];
   recentEvents: EngineEvent[];
   logs: string[];
+  // EventEdge V2
+  regime: Record<string, MarketRegimeType>;
+  regimeConfidence: Record<string, number>;
+  expertVotes: Record<string, Record<string, number>>;
+  edge: Record<string, Partial<EdgeResult>>;
+  modelHealth: Record<string, unknown>;
+  calibrationStatus: string;
+  lastRejected: Array<{ symbol: string; reason: string; detail?: string }>;
+  shadowTrades: Array<Record<string, unknown>>;
 }
 
 type Action =
@@ -42,6 +54,14 @@ const initialState: State = {
   recentTrades: [],
   recentEvents: [],
   logs: [],
+  regime: {},
+  regimeConfidence: {},
+  expertVotes: {},
+  edge: {},
+  modelHealth: {},
+  calibrationStatus: "NOT_READY",
+  lastRejected: [],
+  shadowTrades: [],
 };
 
 function reducer(state: State, action: Action): State {
@@ -88,16 +108,90 @@ function reducer(state: State, action: Action): State {
             recentEvents,
           };
         }
-        case "risk_gate": {
+        // ── EventEdge V2 Events ──
+        case "regime_update": {
           const sym = p.symbol as string;
-          const existing = state.symbols[sym] || { symbol: sym };
-          const gates = [...(existing.riskGates || []), p as unknown as RiskGateResult].slice(-5);
           return {
             ...state,
+            regime: { ...state.regime, [sym]: p.regime as MarketRegimeType },
+            regimeConfidence: { ...state.regimeConfidence, [sym]: p.confidence as number },
             symbols: {
               ...state.symbols,
-              [sym]: { ...existing, riskGates: gates },
+              [sym]: { ...state.symbols[sym], symbol: sym, regime: p.regime as MarketRegimeType },
             },
+            recentEvents,
+          };
+        }
+        case "expert_votes": {
+          const sym = p.symbol as string;
+          const votes = p.votes as Record<string, { prob: number; dir: string }>;
+          const voteMap: Record<string, number> = {};
+          for (const [name, v] of Object.entries(votes)) {
+            voteMap[name] = v.prob;
+          }
+          return {
+            ...state,
+            expertVotes: { ...state.expertVotes, [sym]: voteMap },
+            recentEvents,
+          };
+        }
+        case "edge_calculation": {
+          const sym = p.symbol as string;
+          return {
+            ...state,
+            edge: {
+              ...state.edge,
+              [sym]: {
+                calibratedProbability: p.calibrated_probability as number,
+                conservativeProbability: p.conservative_probability as number,
+                breakEvenProbability: p.break_even_probability as number,
+                effectiveEdge: p.effective_edge as number,
+                expectedRoi: p.expected_roi as number,
+                passed: p.passed as boolean,
+                rejectReason: (p.reject_reason as RejectReasonCode) || "",
+              },
+            },
+            recentEvents,
+          };
+        }
+        case "model_health": {
+          return {
+            ...state,
+            modelHealth: {
+              ...state.modelHealth,
+              window: p.window as number,
+              isDegraded: p.is_degraded as boolean,
+              actualWinRate: p.actual_win_rate as number,
+              predictedWinRate: p.predicted_win_rate as number,
+              winRateDelta: p.win_rate_delta as number,
+              brierScore: p.brier_score as number,
+              ece: (p as Record<string, unknown>).ece as number,
+              tradeCount: (p as Record<string, unknown>).trade_count as number,
+            },
+            recentEvents,
+          };
+        }
+        case "calibration_status": {
+          return {
+            ...state,
+            calibrationStatus: (p.status as string) || "NOT_READY",
+            recentEvents,
+          };
+        }
+        case "trade_rejected": {
+          return {
+            ...state,
+            lastRejected: [
+              ...state.lastRejected,
+              { symbol: p.symbol as string, reason: p.reason as string, detail: (p as Record<string, unknown>).detail as string },
+            ].slice(-20),
+            recentEvents,
+          };
+        }
+        case "shadow_trade": {
+          return {
+            ...state,
+            shadowTrades: [...state.shadowTrades, p as Record<string, unknown>].slice(-100),
             recentEvents,
           };
         }

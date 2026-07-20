@@ -104,3 +104,65 @@ LOSE_STREAK_TRIGGER = int(os.getenv("LOSE_STREAK_TRIGGER", "2"))
 # --- Session ---
 ACTIVE_HOURS_START = int(os.getenv("ACTIVE_HOURS_START", "0"))
 ACTIVE_HOURS_END = int(os.getenv("ACTIVE_HOURS_END", "24"))
+
+# ── Phase 2: Trade/Settlement Ledger ──
+TRADE_LEDGER_PATH = os.getenv("TRADE_LEDGER_PATH", "./data/trade_ledger.jsonl")
+
+# ── Shadow Mode: Per-symbol activation ──
+# "SHADOW_ACTIVE" = simulate trades, record results
+# "OBSERVE_ONLY" = generate predictions, record, but NO trades (even simulated)
+# "DISABLED" = skip entirely
+SHADOW_SYMBOL_MODE = {
+    "BTCUSDT": os.getenv("SHADOW_BTC_MODE", "OBSERVE_ONLY"),
+    "ETHUSDT": os.getenv("SHADOW_ETH_MODE", "SHADOW_ACTIVE"),
+    "SOLUSDT": os.getenv("SHADOW_SOL_MODE", "SHADOW_ACTIVE"),
+}
+
+# ── LIVE Gate ──
+LIVE_ENABLED = os.getenv("LIVE_ENABLED", "false").lower() == "true"
+# LIVE requires: calibration READY + shadow validation PASSED + LIVE_ENABLED=true
+LIVE_REQUIRE_CALIBRATION = os.getenv("LIVE_REQUIRE_CALIBRATION", "true").lower() == "true"
+LIVE_REQUIRE_SHADOW_VALIDATION = os.getenv("LIVE_REQUIRE_SHADOW_VALIDATION", "true").lower() == "true"
+
+# ── Shadow Graduation Criteria ──
+SHADOW_MIN_DAYS = int(os.getenv("SHADOW_MIN_DAYS", "7"))
+SHADOW_MIN_TRADES = int(os.getenv("SHADOW_MIN_TRADES", "200"))
+SHADOW_MIN_WIN_RATE = float(os.getenv("SHADOW_MIN_WIN_RATE", "0.50"))
+
+# ── Shadow Record Path ──
+SHADOW_RECORD_PATH = os.getenv("SHADOW_RECORD_PATH", "./data/shadow_candidates.jsonl")
+
+# ── Integer Order Constraints ──
+MIN_ORDER_USD = int(os.getenv("MIN_ORDER_USD", "3"))           # HIBT 最低下注
+ORDER_AMOUNT_STEP = int(os.getenv("ORDER_AMOUNT_STEP", "1"))   # 必须是整数 USDT
+
+# ── Portfolio Risk ──
+MAX_BET_FRACTION = float(os.getenv("MAX_BET_FRACTION", "0.01"))   # 单笔最大净值比例 (1%)
+MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "0.05"))  # 最大总敞口 (5%)
+MAX_CORRELATED_EXPOSURE = float(os.getenv("MAX_CORRELATED_EXPOSURE", "0.03"))  # 最大关联敞口 (3%)
+DAILY_STOP = float(os.getenv("DAILY_STOP", "0.05"))              # 日亏损限制 (5%)
+WEEKLY_DRAWDOWN_STOP = float(os.getenv("WEEKLY_DRAWDOWN_STOP", "0.10"))  # 周回撤限制 (10%)
+
+# ── Small Account ──
+SMALL_ACCOUNT_MAX_BET_FRACTION = float(os.getenv("SMALL_ACCOUNT_MAX_BET_FRACTION", "0.0"))  # 0=禁止自动放宽
+
+# ── Edge Engine ──
+MIN_EFFECTIVE_EDGE = float(os.getenv("MIN_EFFECTIVE_EDGE", "0.02"))       # 最小有效优势 (2%)
+MIN_EXPECTED_ROI = float(os.getenv("MIN_EXPECTED_ROI", "0.005"))           # 最小期望ROI (0.5%)
+
+# ── Uncertainty ──
+DEFAULT_UNCERTAINTY_MARGIN = float(os.getenv("DEFAULT_UNCERTAINTY_MARGIN", "0.02"))    # 默认不确定性折扣
+DEFAULT_CALIBRATION_MARGIN = float(os.getenv("DEFAULT_CALIBRATION_MARGIN", "0.01"))    # 默认校准折扣
+DEFAULT_DEGRADATION_MARGIN = float(os.getenv("DEFAULT_DEGRADATION_MARGIN", "0.00"))    # 默认模型退化折扣
+
+# ── Model Health ──
+MIN_HEALTH_SAMPLE = int(os.getenv("MIN_HEALTH_SAMPLE", "50"))            # 最小健康检查样本
+MODEL_DEGRADED_WIN_RATE_DELTA = float(os.getenv("MODEL_DEGRADED_WIN_RATE_DELTA", "0.10"))  # 实际胜率低于预测10%触发
+MODEL_DEGRADED_BRIER_THRESHOLD = float(os.getenv("MODEL_DEGRADED_BRIER_THRESHOLD", "0.30"))  # Brier Score > 0.30 触发
+
+# ── Available Expiries (已验证) ──
+AVAILABLE_EXPIRIES = [int(x) for x in os.getenv("AVAILABLE_EXPIRIES", "15").split(",")]  # 15m 已验证
+EXPIRY_DISCOVERY_UNAVAILABLE = os.getenv("EXPIRY_DISCOVERY_UNAVAILABLE", "true").lower() == "true"  # 启动时警告
+
+# ── Payout Source ──
+PAYOUT_SOURCE = os.getenv("PAYOUT_SOURCE", "hardcoded")  # "api" / "hardcoded" / "estimated"

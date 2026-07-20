@@ -148,6 +148,8 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
                 impersonate="chrome110", verify=False, timeout=10,
             )
             rj = res.json()
+            # ── Phase 1.5: 打印完整下单响应，发现隐藏字段 ──
+            print(f"[HIBT Order Response] {json.dumps(rj, ensure_ascii=False)}", flush=True)
             if rj.get("code") in [0, 200, "0", "200"]:
                 return OrderResult(ok=True, code=200, msg="下单成功")
             # API明确拒绝 → 直接返回失败（不要换 endpoint 重试，防止重复下单）

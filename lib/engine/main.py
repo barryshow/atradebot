@@ -14,9 +14,10 @@ import os
 import warnings
 import signal
 import atexit
+import tempfile
 
 # ── PID lock ──────────────────────────────────────────────────────────
-PID_FILE = "/tmp/atradebot_engine.pid"
+PID_FILE = os.path.join(tempfile.gettempdir(), "atradebot_engine.pid")
 
 def _acquire_pid_lock() -> bool:
     """Write PID file with flock semantics. Returns False if another instance is running."""
@@ -64,6 +65,7 @@ for k in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy",
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from lib.engine.engine import TradingEngine, emit
+from lib.engine.shadow_mode import RunMode, set_run_mode, get_shadow_mode
 
 
 def stdin_reader(engine: TradingEngine):
@@ -81,6 +83,8 @@ def stdin_reader(engine: TradingEngine):
 
             action = cmd.get("command", "")
             if action == "start":
+                run_mode = cmd.get("mode", "live")
+                engine.set_run_mode(run_mode)
                 engine.start()
             elif action == "stop":
                 engine.stop()
@@ -105,6 +109,15 @@ def main():
     atexit.register(_release_pid_lock)
     # ────────────────────────────────────────────────────────
 
+    # ── Parse args for auto-start ───────────────────────────
+    import argparse
+    parser_auto = argparse.ArgumentParser()
+    parser_auto.add_argument("--auto", action="store_true", help="Auto-start engine without waiting for frontend command")
+    parser_auto.add_argument("--mode", type=str, default="shadow", choices=["live", "shadow", "backtest"],
+                        help="Run mode (default: shadow)")
+    auto_args, _ = parser_auto.parse_known_args()
+    # ────────────────────────────────────────────────────────
+
     engine = TradingEngine()
 
     # Start stdin command reader in background (waits for frontend commands)
@@ -114,17 +127,26 @@ def main():
     # Emit initial idle state — engine is alive but waiting for frontend "start"
     emit("status", {"state": "stopped", "msg": "Engine ready, waiting for frontend start command"})
 
-    # Main loop — ticks only when engine.running is True
+    # ── Auto-start if requested, or if running interactively ──
+    if auto_args.auto or sys.stdin.isatty():
+        if not auto_args.auto:
+            emit("log", {"msg": "Interactive mode detected, auto-starting"})
+        engine.set_run_mode(auto_args.mode)
+        engine.start()
+        emit("log", {"msg": f"Auto-start mode: {auto_args.mode}"})
+
+    # Main loop — ticks when running, waits when stopped
     last_balance_check = time.time()
-    while engine.running or engine.paused:
+    idle_count = 0
+    while True:
         if engine.running and not engine.paused:
             try:
                 engine.tick()
             except Exception as e:
                 emit("error", {"msg": f"Main loop error: {str(e)[:200]}"})
 
-            # Periodic balance refresh
-            if time.time() - last_balance_check > 30:
+            # Periodic balance refresh (skip if shadow simulated balance)
+            if time.time() - last_balance_check > 30 and not getattr(engine, '_shadow_simulated_balance', False):
                 try:
                     from lib.engine.exchange import fetch_balance
                     rb = fetch_balance()
@@ -134,6 +156,16 @@ def main():
                 except Exception:
                     pass
                 last_balance_check = time.time()
+
+        elif engine.paused:
+            pass  # wait for resume
+
+        elif not engine.running:
+            # Engine stopped — exit if idle too long (no start command received)
+            idle_count += 1
+            if idle_count > 30:  # 30 * 2s = 60s timeout
+                emit("status", {"state": "stopped", "msg": "No start command received within 60s, exiting"})
+                break
 
         # Emit status heartbeat
         emit("status", engine.get_status())
