@@ -43,12 +43,20 @@ def emit(event_type: str, payload: dict):
 
 
 def _fuse_probabilities(fast_prob: float, slow_prob: float, features: dict) -> float:
-    """融合 Fast 和 Slow 概率"""
-    if abs(fast_prob - slow_prob) > 0.10:
-        w = 0.6  # 冲突时偏向 Fast
+    """融合 Fast 和 Slow 概率。
+    当 Slow 模型无强意见（概率接近0.50）时，更信任 Fast；
+    当两者一致时，等权；当冲突时，偏向 Fast。"""
+    slow_confidence = abs(slow_prob - 0.50)  # Slow 模型偏离0.50的程度
+    if slow_confidence < 0.02:
+        # Slow 模型无意见 → Fast 权重 0.85
+        w_fast = 0.85
+    elif abs(fast_prob - slow_prob) > 0.10:
+        # 冲突 → Fast 权重 0.70
+        w_fast = 0.70
     else:
-        w = 0.5
-    return w * fast_prob + (1 - w) * slow_prob
+        # 一致 → 等权
+        w_fast = 0.50
+    return w_fast * fast_prob + (1 - w_fast) * slow_prob
 
 
 @dataclass
@@ -287,7 +295,7 @@ class TradingEngine:
                 ensemble_prob = max(0.35, 1.0 - ensemble_prob)
 
             edge = self.edge_engine.compute(
-                symbol=sym, calibrated_probability=ensemble_prob,
+                symbol=sym, calibrated_probability=fast_prob,  # 用 Fast prob 计算 Edge
                 direction=direction_str, direction_int=direction,
                 expiry_minutes=config.HOLD_MINUTES, entry_price=rt.price,
                 uncertainty_margin=0.02, regime=slow_ctx.get("regime", "RANGE"))
@@ -380,6 +388,7 @@ class TradingEngine:
             self._hourly_trade_count[opp.symbol] = self._hourly_trade_count.get(opp.symbol, 0) + 1
 
     def _update_slow_context(self, sym: str, df_1m: pd.DataFrame):
+        """每 15 分钟更新 Slow Context（用 15m K 线真实数据）"""
         if df_1m is None or len(df_1m) < 15: return
         last_bar = df_1m.index[-1]
         last_update = self._last_slow_update.get(sym, 0)
@@ -387,11 +396,62 @@ class TradingEngine:
             bar_ts = last_bar.timestamp()
             if bar_ts - last_update < 840: return
             self._last_slow_update[sym] = bar_ts
-        indicators = {"ADX": 20.0, "RSI": 50.0, "BB_Pos": 0.5, "bb_width": 0.02,
-            "volatility_ratio": 1.0, "ATR_pct": 0.003, "price_vs_MA20": 0.0,
-            "MACD": 0.0, "MA_trend": 0.0, "VWAP_dist": 0.0,
-            "vol_ratio": 1.0, "CCI": 0.0}
+
+        # 用 15m K 线数据计算真实指标
+        df_15m = self._realtime_feed.get_klines(sym, "15m") if self._realtime_feed else None
+        if df_15m is None and self._realtime_feed:
+            # 从 1m 聚合 15m
+            df_15m_raw = df_1m.resample("15min").agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna()
+        else:
+            df_15m_raw = df_15m
+
+        if df_15m_raw is not None and len(df_15m_raw) >= 50:
+            # 计算真实指标
+            closes = df_15m_raw["close"].values.astype(float)
+            eps = 1e-10
+            # ADX approximation
+            adx = min(40.0, 20.0 + abs(float(np.mean(np.diff(closes[-20:])) / max(np.mean(closes[-20:]), eps) * 10000)))
+            # RSI
+            deltas = np.diff(closes[-15:])
+            gains = np.maximum(deltas, 0).mean()
+            losses = np.maximum(-deltas, 0).mean()
+            rs = gains / max(losses, eps)
+            rsi = float(100 - 100 / (1 + rs))
+            # BB position
+            mid = float(np.mean(closes[-20:]))
+            std = float(np.std(closes[-20:]))
+            bb_upper = mid + 2*std
+            bb_lower = mid - 2*std
+            bb_pos = float((closes[-1] - bb_lower) / max(bb_upper - bb_lower, eps))
+            bb_pos = max(0.0, min(1.0, bb_pos))
+            # Volatility ratio
+            vol_ratio = float(std / max(mid, eps) * 100)
+            vol_ratio = max(0.5, min(3.0, vol_ratio))
+            # Price vs MA20
+            ma20 = float(np.mean(closes[-20:]))
+            price_vs_ma20 = float((closes[-1] - ma20) / max(ma20, eps))
+            # MACD
+            ema12 = pd.Series(closes[-20:]).ewm(span=12, adjust=False).mean().values[-1]
+            ema26 = pd.Series(closes[-20:]).ewm(span=26, adjust=False).mean().values[-1] if len(closes) >= 26 else ema12
+            macd = float(ema12 - ema26)
+
+            indicators = {
+                "ADX": adx, "RSI": rsi, "BB_Pos": bb_pos, "bb_width": float(std/max(mid, eps)),
+                "volatility_ratio": vol_ratio, "ATR_pct": float(std/max(mid, eps)),
+                "price_vs_MA20": price_vs_ma20, "MACD": macd,
+                "MA_trend": 1.0 if closes[-1] > ma20 else -1.0,
+                "VWAP_dist": 0.0, "vol_ratio": 1.0, "CCI": 0.0,
+            }
+        else:
+            indicators = {"ADX": 20.0, "RSI": 50.0, "BB_Pos": 0.5, "bb_width": 0.02,
+                "volatility_ratio": 1.0, "ATR_pct": 0.003, "price_vs_MA20": 0.0,
+                "MACD": 0.0, "MA_trend": 0.0, "VWAP_dist": 0.0, "vol_ratio": 1.0, "CCI": 0.0}
+
         row = {"ret_1": 0.0, "ret_3": 0.0, "ret_6": 0.0, "body_pct": 0.3}
+
         try:
             predictions = self.expert_manager.predict_all(sym, indicators, row)
             regime = self.regime_detector.detect(indicators)
@@ -403,6 +463,11 @@ class TradingEngine:
         except Exception:
             self._slow_context[sym] = {"probability": 0.50, "regime": "RANGE",
                 "trend_strength": 0.0, "volatility": 0.5}
+
+        # 发出 regime_update
+        emit("regime_update", {"symbol": sym, "regime": self._slow_context[sym]["regime"],
+            "confidence": 0.7, "adx": indicators.get("ADX", 20),
+            "volatility": indicators.get("volatility_ratio", 1.0)})
 
     # ═══════════════════════════════════════════════════════════
     # Order Execution (shared by Fast Entry + old 15m pipeline)
