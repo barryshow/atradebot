@@ -374,9 +374,9 @@ class TradingEngine:
                 emit("log", {"msg": f"DATA_STALE: {symbol} 最新K线 {latest_bar_ts} 距今 {data_age_minutes:.0f}min > {max_stale_minutes}min"})
             return None
 
-        # ── Bar Detection: 使用 15m 聚合检测新 bar ──
-        # FEATURE_USES_CLOSED_CANDLES: 只使用已完成的 bar
-        # 检测到新 bar 时，exclude 最后一根（可能正在 forming）
+        # ── Bar Detection ──
+        # FEATURE_USES_CLOSED_CANDLES = true
+        # Gate.io 15m API 只返回已收盘 K 线，最后一根就是最新 closed bar
         candle_min = config.CANDLE_INTERVAL_MIN
         detect_data = df_s.resample(f"{candle_min}min").agg({
             "open": "first", "high": "max", "low": "min",
@@ -386,31 +386,27 @@ class TradingEngine:
         if len(detect_data) < 10:
             return None
 
-        # ── 使用倒数第二根已完成 bar 作为决策触发点 ──
-        # 最后一根可能正在 forming，倒数第二根是确定已完成的
-        if len(detect_data) < 2:
-            return None
-        closed_bar_ts = detect_data.index[-2]  # 最后完成的 bar
-        current_bar_ts = detect_data.index[-1]  # 可能正在 forming 的 bar
+        # 最新已收盘 bar（Gate.io 不返回 forming bar）
+        latest_bar_ts = detect_data.index[-1]
 
         if not self._last_decision_bar.get(symbol):
-            self._last_decision_bar[symbol] = closed_bar_ts
-            emit("log", {"msg": f"预热完成 {symbol}: 最后完成bar={closed_bar_ts}, 当前bar={current_bar_ts}"})
+            self._last_decision_bar[symbol] = latest_bar_ts
+            emit("log", {"msg": f"预热完成 {symbol}: bar={latest_bar_ts}"})
             self._sys_funnel_count("warmup_skip")
             return None
 
-        if self._last_decision_bar.get(symbol) == closed_bar_ts:
+        if self._last_decision_bar.get(symbol) == latest_bar_ts:
             self._sys_funnel_count("no_new_bar")
             return None
 
         # ── 新 bar 触发决策！──
-        self._last_decision_bar[symbol] = closed_bar_ts
+        self._last_decision_bar[symbol] = latest_bar_ts
         self._bars_evaluated_total[symbol] = self._bars_evaluated_total.get(symbol, 0) + 1
         self._sys_funnel_count("bars_evaluated")
 
-        # ── 特征计算: 只用已收盘 bar（exclude 最后一根 forming bar）──
+        # ── 特征计算: 所有 bar 都是 closed ──
         feat_min = config.FEATURE_INTERVAL_MIN
-        feature_data = detect_data.iloc[:-1].copy()  # exclude the forming bar
+        feature_data = detect_data.copy()
         if len(feature_data) < 200:
             return None
 
@@ -505,17 +501,17 @@ class TradingEngine:
             "reject_reason": edge.reject_reason,
         })
 
-        # ── DECISION_CYCLE log ──
-        cal_ready = self.calibrator.is_ready()
+        # ── DECISION_CYCLE full log ──
+        cal_now = self.calibrator.is_ready()
         emit("decision_cycle", {
             "symbol": symbol,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "bar_timestamp": str(current_bar_ts),
-            "last_closed_bar_timestamp": str(closed_bar_ts),
+            "bar_timestamp": str(latest_bar_ts),
+            "bar_closed": True,
             "regime": regime.regime,
             "raw_probability": round(ensemble.ensemble_probability, 4),
             "ensemble_probability": round(ensemble.ensemble_probability, 4),
-            "calibration_status": "PASSTHROUGH_UNCALIBRATED" if not cal_ready else "CALIBRATED",
+            "calibration_status": "PASSTHROUGH_UNCALIBRATED" if not cal_now else "CALIBRATED",
             "conservative_probability": round(edge.conservative_probability, 4),
             "payout_ratio": round(edge.net_payout_ratio, 4),
             "break_even_probability": round(edge.break_even_probability, 4),
