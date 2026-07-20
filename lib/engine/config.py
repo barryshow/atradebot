@@ -113,9 +113,9 @@ TRADE_LEDGER_PATH = os.getenv("TRADE_LEDGER_PATH", "./data/trade_ledger.jsonl")
 # "OBSERVE_ONLY" = generate predictions, record, but NO trades (even simulated)
 # "DISABLED" = skip entirely
 SHADOW_SYMBOL_MODE = {
-    "BTCUSDT": os.getenv("SHADOW_BTC_MODE", "OBSERVE_ONLY"),
-    "ETHUSDT": os.getenv("SHADOW_ETH_MODE", "SHADOW_ACTIVE"),
-    "SOLUSDT": os.getenv("SHADOW_SOL_MODE", "SHADOW_ACTIVE"),
+    "BTCUSDT": os.getenv("SHADOW_BTC_MODE", "SHADOW_ACTIVE"),   # Purged OOS AUC=0.65
+    "ETHUSDT": os.getenv("SHADOW_ETH_MODE", "SHADOW_ACTIVE"),   # Purged OOS AUC=0.65
+    "SOLUSDT": os.getenv("SHADOW_SOL_MODE", "SHADOW_ACTIVE"),   # Purged OOS AUC=0.64
 }
 
 # ── LIVE Gate ──
