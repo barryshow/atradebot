@@ -97,6 +97,25 @@ def stdin_reader(engine: TradingEngine):
                 emit("pong", {"ts": int(time.time() * 1000)})
             elif action == "status":
                 emit("status", engine.get_status())
+            elif action == "manual_order_test":
+                # 手动测试下单 — 仅验证接口，不参与策略统计
+                test_symbol = cmd.get("symbol", "")
+                test_dir = cmd.get("direction", 0)
+                test_amount = cmd.get("amount", 3)
+                if test_symbol and test_dir:
+                    from lib.engine.exchange import place_order
+                    result = place_order(test_symbol, test_dir, test_amount, 15)
+                    emit("manual_order_result", {
+                        "ok": result.ok,
+                        "code": result.code,
+                        "msg": result.msg,
+                        "symbol": test_symbol,
+                        "direction": test_dir,
+                        "amount": test_amount,
+                        "order_id": result.order_id,
+                        "open_price": result.open_price,
+                        "lifecycle": "ORDER_ACCEPTED" if result.ok and result.order_id else ("ORDER_REQUESTED" if result.ok else "ORDER_FAILED"),
+                    })
     except (OSError, EOFError, ValueError):
         # stdin closed (nohup/PM2/systemd mode) — silent exit
         pass
@@ -115,10 +134,11 @@ def main():
     parser_auto.add_argument("--auto", action="store_true", help="Auto-start engine without waiting for frontend command")
     parser_auto.add_argument("--mode", type=str, default="shadow", choices=["live", "shadow", "backtest"],
                         help="Run mode (default: shadow)")
+    parser_auto.add_argument("--smoke", action="store_true", help="LIVE_SMOKE_TEST: max 1 trade then auto-stop")
     auto_args, _ = parser_auto.parse_known_args()
     # ────────────────────────────────────────────────────────
 
-    engine = TradingEngine()
+    engine = TradingEngine(run_mode=auto_args.mode, smoke_test=auto_args.smoke)
 
     # Start stdin command reader in background (waits for frontend commands)
     reader = threading.Thread(target=stdin_reader, args=(engine,), daemon=True)

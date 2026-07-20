@@ -157,12 +157,12 @@ export class ProcessManager extends EventEmitter {
     this.emitState();
   }
 
-  private sendCommand(command: string, args?: Record<string, unknown>) {
+  sendCommand(command: string, args?: Record<string, unknown>) {
     if (!this.process?.stdin?.writable) {
       logStore.add(`[process] Cannot send command "${command}": stdin not writable`);
       return;
     }
-    const cmd = JSON.stringify({ command, ...args });
+    const cmd = JSON.stringify({ command, ...(args || {}) });
     try {
       this.process.stdin.write(cmd + "\n", "utf-8");
       logStore.add(`[process] Sent command: ${command}`);

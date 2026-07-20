@@ -14,6 +14,16 @@ class OrderResult:
     ok: bool
     code: Optional[int] = None
     msg: str = ""
+    # ── HIBT 响应字段（从下单响应中提取）──
+    order_id: Optional[str] = None
+    contract_id: Optional[str] = None
+    open_price: Optional[float] = None
+    expiry_time: Optional[int] = None
+    payout_ratio: Optional[float] = None
+    amount: Optional[str] = None
+    direction: Optional[str] = None
+    symbol: Optional[str] = None
+    raw_response: Optional[dict] = None
 
 
 ENDPOINTS = [
@@ -35,6 +45,44 @@ BASE_HEADERS = {
     "Origin": "https://www.hibt.com",
     "Referer": "https://www.hibt.com/",
 }
+
+
+def _safe_float(val):
+    """安全转换 float，处理 None 和缺失"""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_int(val):
+    """安全转换 int"""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_log_response(rj: dict) -> dict:
+    """脱敏：移除敏感字段后返回可安全记录的响应"""
+    if not isinstance(rj, dict):
+        return {"_raw": str(rj)[:200]}
+    safe = {}
+    for k, v in rj.items():
+        if k.lower() in ("token", "authorization", "cookie", "x-auth-token",
+                         "bget_key", "bget_id", "request-id", "signature"):
+            safe[k] = "***REDACTED***"
+        elif isinstance(v, dict):
+            safe[k] = _safe_log_response(v)
+        elif isinstance(v, list):
+            safe[k] = [str(x)[:100] if not isinstance(x, dict) else _safe_log_response(x) for x in v[:5]]
+        else:
+            safe[k] = v
+    return safe
 
 
 def _generate_request_id() -> str:
@@ -148,10 +196,23 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
                 impersonate="chrome110", verify=False, timeout=10,
             )
             rj = res.json()
-            # ── Phase 1.5: 打印完整下单响应，发现隐藏字段 ──
-            print(f"[HIBT Order Response] {json.dumps(rj, ensure_ascii=False)}", flush=True)
+            # ── 记录完整响应结构（脱敏）──
+            safe_log = _safe_log_response(rj)
+            print(f"[HIBT Order Response] {json.dumps(safe_log, ensure_ascii=False)}", flush=True)
             if rj.get("code") in [0, 200, "0", "200"]:
-                return OrderResult(ok=True, code=200, msg="下单成功")
+                # 提取订单字段
+                return OrderResult(
+                    ok=True, code=200, msg="下单成功",
+                    order_id=str(rj.get("data", {}).get("orderId", rj.get("orderId", ""))),
+                    contract_id=str(rj.get("data", {}).get("contractId", rj.get("contractId", ""))),
+                    open_price=_safe_float(rj.get("data", {}).get("openPrice", rj.get("openPrice"))),
+                    expiry_time=_safe_int(rj.get("data", {}).get("expiryTime", rj.get("expiryTime"))),
+                    payout_ratio=_safe_float(rj.get("data", {}).get("payout", rj.get("payout"))),
+                    amount=str(data["amount"]),
+                    direction=str(data["direction"]),
+                    symbol=str(data["symbol"]),
+                    raw_response=rj,
+                )
             # API明确拒绝 → 直接返回失败（不要换 endpoint 重试，防止重复下单）
             return OrderResult(ok=False, code=rj.get("code"), msg=rj.get("msg", res.text[:30]))
         except Exception as e:

@@ -32,6 +32,18 @@ class SettlementStatus:
     EXPIRED = "EXPIRED"            # 超时未确认
 
 
+# ── 订单生命周期状态 ──
+class TradeLifecycle:
+    ORDER_REQUESTED = "ORDER_REQUESTED"        # 已向 HIBT 发送下单请求
+    ORDER_ACCEPTED = "ORDER_ACCEPTED"          # HIBT 返回成功，有 order_id
+    ORDER_EXECUTED = "ORDER_EXECUTED"          # 订单已执行（如果有 execution 回调）
+    ORDER_FAILED = "ORDER_FAILED"              # HIBT 拒绝下单
+    SETTLEMENT_PENDING = "SETTLEMENT_PENDING"  # 到期，等待结算
+    SETTLED_VERIFIED = "SETTLED_VERIFIED"      # HIBT 官方结算确认
+    SETTLED_UNVERIFIED = "SETTLED_UNVERIFIED"  # 时间推算结算，非官方确认
+    OPEN_PRICE_UNVERIFIED = "OPEN_PRICE_UNVERIFIED"  # 开盘价未从 HIBT 确认
+
+
 # ── 拒绝原因常量 ──
 class RejectReason:
     NO_EDGE = "NO_EDGE"                              # 无概率优势

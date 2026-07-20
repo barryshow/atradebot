@@ -129,7 +129,7 @@ class CandidateOpportunity:
 
 
 class TradingEngine:
-    def __init__(self, run_mode: str = "live"):
+    def __init__(self, run_mode: str = "live", smoke_test: bool = False):
         self.executor = OrderExecutor()
         self.reset_state()
 
@@ -148,6 +148,11 @@ class TradingEngine:
         # 运行模式
         mode = RunMode.LIVE if run_mode == "live" else (RunMode.SHADOW if run_mode == "shadow" else RunMode.BACKTEST)
         self.shadow = ShadowMode(mode=mode)
+
+        # ── LIVE_SMOKE_TEST ──
+        self._smoke_test = smoke_test
+        self._smoke_order_count = 0
+        self._smoke_max_orders = 1
 
         # 健康追踪
         self._health_trades: list = []  # [{"predicted_prob": float, "result": str, "pnl": float}, ...]
@@ -689,9 +694,20 @@ class TradingEngine:
 
         if self.shadow.can_place_order():
             # ── LIVE 模式: 真实下单 ──
+            # ── SMOKE_TEST: 最多1笔 ──
+            if self._smoke_test and self._smoke_order_count >= self._smoke_max_orders:
+                emit("trade_rejected", {
+                    "symbol": symbol, "reason": "SMOKE_TEST_LIMIT",
+                    "detail": f"已达 {self._smoke_max_orders} 笔上限，自动停止",
+                })
+                return False
+
             result = place_order(symbol, direction_int, stake_usd, config.HOLD_MINUTES)
             if result.ok:
-                # 先保存到 TradeLedger 获取唯一 trade_id
+                # ── 记录生命周期: ORDER_ACCEPTED ──
+                lifecycle = "ORDER_ACCEPTED" if result.order_id else "ORDER_REQUESTED"
+                open_price_status = "OPEN_PRICE_UNVERIFIED" if result.open_price is None else ""
+
                 rec = self.trade_ledger.create_record(
                     symbol=symbol, direction=direction_str, direction_int=direction_int,
                     entry_time_ms=current_ts, entry_price=current_price,
@@ -706,22 +722,38 @@ class TradingEngine:
                     regime=regime.regime,
                     expert_votes=ensemble.expert_votes,
                 )
+                # 回填 HIBT 返回的字段
+                if result.order_id:
+                    rec.hibt_order_id = result.order_id
+                rec.settlement_status = lifecycle
                 self.trade_ledger.save(rec)
 
-                # 记录 active_trade 时附带 trade_id（贯穿全链路）
                 self.active_trades.append({
                     "symbol": symbol, "dir": direction_int,
                     "direction_str": direction_str,
                     "start_ts": current_ts, "amount": stake_usd,
                     "entry": current_price, "pre_balance": self.balance,
                     "trade_id": rec.trade_id,
+                    "hibt_order_id": result.order_id,
+                    "lifecycle": lifecycle,
+                    "open_price_verified": result.open_price is not None,
+                    "predicted_entry_price": current_price,
+                    "hibt_open_price": result.open_price,
                 })
                 self.last_trade_ts[symbol] = current_ts
                 self.last_signal_bar_ts[symbol] = current_bar_ts
 
+                # ── SMOKE_TEST: 下单后自动停止 ──
+                if self._smoke_test:
+                    self._smoke_order_count += 1
+                    emit("log", {"msg": f"SMOKE_TEST: 第 {self._smoke_order_count}/{self._smoke_max_orders} 笔完成"})
+                    if self._smoke_order_count >= self._smoke_max_orders:
+                        emit("log", {"msg": "SMOKE_TEST: 上限已达，自动进入观察模式"})
+
                 emit("trade_executed", {
                     "symbol": symbol, "direction": direction_str,
                     "trade_id": rec.trade_id,
+                    "hibt_order_id": result.order_id,
                     "entryPrice": current_price, "amount": stake_usd,
                     "rawProbability": ensemble.ensemble_probability,
                     "calibratedProbability": edge.calibrated_probability,
@@ -729,6 +761,10 @@ class TradingEngine:
                     "expectedRoi": edge.expected_roi,
                     "balance": self.balance,
                     "regime": regime.regime,
+                    "lifecycle": lifecycle,
+                    "open_price_verified": result.open_price is not None,
+                    "predicted_entry_price": current_price,
+                    "hibt_open_price": result.open_price,
                 })
                 notify_trade(
                     symbol, f"做多(CALL)" if direction_int == 1 else f"做空(PUT)",
@@ -747,7 +783,25 @@ class TradingEngine:
                 emit("trade_rejected", {
                     "symbol": symbol, "reason": "ORDER_FAILED",
                     "detail": result.msg,
+                    "hibt_code": result.code,
                 })
+                # 记录失败
+                rec = self.trade_ledger.create_record(
+                    symbol=symbol, direction=direction_str, direction_int=direction_int,
+                    entry_time_ms=current_ts, entry_price=current_price,
+                    stake_usd=stake_usd, expiry_minutes=config.HOLD_MINUTES,
+                    raw_probability=ensemble.ensemble_probability,
+                    calibrated_probability=edge.calibrated_probability,
+                    break_even_probability=edge.break_even_probability,
+                    effective_edge=edge.effective_edge,
+                    expected_roi=edge.expected_roi,
+                    regime=regime.regime,
+                    expert_votes=ensemble.expert_votes,
+                    reject_reason="ORDER_FAILED",
+                    reject_detail=f"code={result.code}, msg={result.msg}",
+                )
+                rec.settlement_status = "ORDER_FAILED"
+                self.trade_ledger.save(rec)
                 return False
         else:
             # ── SHADOW_ACTIVE: 模拟下单 ──
@@ -816,11 +870,6 @@ class TradingEngine:
                 self._record_result(is_win)
             result = "tie" if is_tie else ("win" if is_win else "loss")
 
-            emit("trade_result", {
-                "symbol": t["symbol"], "result": result, "pnl": round(pnl, 4),
-                "entryPrice": t["entry"], "dir": t["dir"],
-                "trade_id": t.get("trade_id", ""),
-            })
             notify_result(t["symbol"], is_win, pnl)
 
             # ── 从 TradeLedger 读取真实概率 ──
@@ -841,11 +890,27 @@ class TradingEngine:
                         break
 
             # ── 更新 SettlementLedger（使用精确 trade_id）──
+            # 当前无法获取 HIBT 官方结算 → SETTLED_UNVERIFIED
+            settlement_status = "SETTLED_UNVERIFIED"
             self.settlement_ledger.estimate_settlement(
                 trade_id=trade_id if trade_id else "",
                 current_balance=current_balance,
                 pre_balance=t["pre_balance"],
             )
+            # 覆盖 settlement_status 为 UNVERIFIED（estimate_settlement 默认 ESTIMATED）
+            if trade_id:
+                self.trade_ledger._update_field(trade_id, "settlement_status", settlement_status)
+
+            emit("trade_result", {
+                "symbol": t["symbol"], "result": result, "pnl": round(pnl, 4),
+                "entryPrice": t["entry"], "dir": t["dir"],
+                "trade_id": t.get("trade_id", ""),
+                "settlement": settlement_status,
+                "hibt_order_id": t.get("hibt_order_id"),
+                "open_price_verified": t.get("open_price_verified", False),
+                "predicted_entry_price": t.get("predicted_entry_price"),
+                "hibt_open_price": t.get("hibt_open_price"),
+            })
 
             # ── 更新 Expert 表现 ──
             direction_str = t.get("direction_str", "")
