@@ -18,12 +18,16 @@ export interface EngineStatus {
   runMode?: RunMode;
   calibrationReady?: boolean;
   healthTradeCount?: number;
+  fastScanCount?: number;
+  fastScanInterval?: number;
+  fastModelLoaded?: boolean;
   liveGate?: {
     passed: boolean;
     reasons: string[];
-    checks: Record<string, boolean>;
+    hard_blocks?: string[];
+    soft_warnings?: string[];
   };
-  symbol_modes?: Record<string, string>;
+  symbolModes?: Record<string, string>;
 }
 
 export type EngineEventType =
@@ -52,7 +56,9 @@ export type EngineEventType =
   | "decision_cycle"
   | "funnel"
   | "emergency_stop"
-  | "manual_order_result";
+  | "manual_order_result"
+  | "fast_scan"
+  | "funnel";
 
 export interface EngineEvent {
   type: EngineEventType;

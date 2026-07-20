@@ -168,5 +168,13 @@ MODEL_DEGRADED_BRIER_THRESHOLD = float(os.getenv("MODEL_DEGRADED_BRIER_THRESHOLD
 AVAILABLE_EXPIRIES = [int(x) for x in os.getenv("AVAILABLE_EXPIRIES", "15").split(",")]  # 15m 已验证
 EXPIRY_DISCOVERY_UNAVAILABLE = os.getenv("EXPIRY_DISCOVERY_UNAVAILABLE", "true").lower() == "true"  # 启动时警告
 
+# ── Fast Entry Scan (实时多周期) ──
+FAST_SCAN_INTERVAL_SECONDS = int(os.getenv("FAST_SCAN_INTERVAL_SECONDS", "5"))
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "60"))
+ALLOW_SAME_DIRECTION_STACKING = os.getenv("ALLOW_SAME_DIRECTION_STACKING", "false").lower() == "true"
+ALLOW_OPPOSITE_OVERLAP = os.getenv("ALLOW_OPPOSITE_OVERLAP", "false").lower() == "true"
+MAX_NEW_TRADES_PER_HOUR = int(os.getenv("MAX_NEW_TRADES_PER_HOUR", "4"))
+MAX_ACTIVE_EVENT_CONTRACTS = int(os.getenv("MAX_ACTIVE_EVENT_CONTRACTS", "3"))
+
 # ── Payout Source ──
 PAYOUT_SOURCE = os.getenv("PAYOUT_SOURCE", "hardcoded")  # "api" / "hardcoded" / "estimated"
