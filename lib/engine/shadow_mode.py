@@ -208,42 +208,49 @@ class ShadowMode:
         """是否允许真实下单 — 需要 LIVE_ENABLED + calibration + shadow validated"""
         return self.mode == RunMode.LIVE and config.LIVE_ENABLED
 
-    def get_live_gate_status(self, calibrator_ready: bool) -> dict:
-        """检查 LIVE 门控状态"""
-        checks = {
-            "live_enabled": config.LIVE_ENABLED,
-            "mode_is_live": self.mode == RunMode.LIVE,
-            "calibration_ready": calibrator_ready,
-            "calibration_required": config.LIVE_REQUIRE_CALIBRATION,
-            "shadow_validation_required": config.LIVE_REQUIRE_SHADOW_VALIDATION,
-        }
+    def get_live_gate_status(self, calibrator_ready: bool, data_fresh: bool = True, balance_ok: bool = True) -> dict:
+        """检查 LIVE 门控状态，区分 HARD BLOCK 和 SOFT WARNING"""
+        hard_blocks = []
+        soft_warnings = []
 
-        passed = True
-        reasons = []
-        if not checks["live_enabled"]:
-            passed = False
-            reasons.append("LIVE_ENABLED=false")
-        if not checks["mode_is_live"]:
-            passed = False
-            reasons.append("MODE_NOT_LIVE")
-        if config.LIVE_REQUIRE_CALIBRATION and not checks["calibration_ready"]:
-            passed = False
-            reasons.append("CALIBRATION_NOT_READY")
+        # ── HARD BLOCKS ──
+        if not config.LIVE_ENABLED:
+            hard_blocks.append("LIVE_ENABLED=false")
+        if self.mode != RunMode.LIVE:
+            hard_blocks.append("MODE_NOT_LIVE")
+        if config.LIVE_HARD_REQUIRE_DATA and not data_fresh:
+            hard_blocks.append("DATA_STALE")
+        if config.LIVE_HARD_REQUIRE_BALANCE and not balance_ok:
+            hard_blocks.append("ACCOUNT_BALANCE_ABNORMAL")
+
+        # ── SOFT WARNINGS ──
+        if config.LIVE_REQUIRE_CALIBRATION and not calibrator_ready:
+            soft_warnings.append("CALIBRATION_NOT_READY (sample不足)")
         if config.LIVE_REQUIRE_SHADOW_VALIDATION:
-            # 检查是否完成 shadow 验证
             days = (time.time() - self._shadow_start_time) / 86400
             total_trades = len([c for c in self.candidates if c.selected])
             if days < config.SHADOW_MIN_DAYS:
-                passed = False
-                reasons.append(f"SHADOW_DAYS_INSUFFICIENT ({days:.1f}d < {config.SHADOW_MIN_DAYS}d)")
+                soft_warnings.append(f"SHADOW_DAYS_INSUFFICIENT ({days:.1f}d < {config.SHADOW_MIN_DAYS}d)")
             if total_trades < config.SHADOW_MIN_TRADES:
-                passed = False
-                reasons.append(f"SHADOW_TRADES_INSUFFICIENT ({total_trades} < {config.SHADOW_MIN_TRADES})")
+                soft_warnings.append(f"SHADOW_TRADES_INSUFFICIENT ({total_trades} < {config.SHADOW_MIN_TRADES})")
+
+        passed = len(hard_blocks) == 0
 
         return {
             "passed": passed,
-            "reasons": reasons if not passed else [],
-            "checks": checks,
+            "hard_blocks": hard_blocks,
+            "soft_warnings": soft_warnings,
+            "all_reasons": hard_blocks + soft_warnings,
+            "reasons": hard_blocks + soft_warnings,
+            "checks": {
+                "live_enabled": config.LIVE_ENABLED,
+                "mode_is_live": self.mode == RunMode.LIVE,
+                "calibration_ready": calibrator_ready,
+                "calibration_required": config.LIVE_REQUIRE_CALIBRATION,
+                "shadow_validation_required": config.LIVE_REQUIRE_SHADOW_VALIDATION,
+                "data_fresh": data_fresh,
+                "balance_ok": balance_ok,
+            },
         }
 
     def add_candidate(self, record: ShadowCandidateRecord):

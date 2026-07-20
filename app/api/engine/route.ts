@@ -8,10 +8,11 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   const body = await req.json();
   const action = body.action as string;
+  const mode = (body.mode as string) || "shadow";
 
   switch (action) {
     case "start": {
-      const result = await processManager.start();
+      const result = await processManager.start(mode);
       return NextResponse.json({ ok: result.ok, state: processManager.getState(), error: result.error });
     }
     case "stop": {

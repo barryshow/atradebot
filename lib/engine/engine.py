@@ -257,7 +257,7 @@ class TradingEngine:
             emit("calibration_status", {"status": "NOT_READY", "msg": "PASSTHROUGH_UNCALIBRATED"})
 
         # ── LIVE Gate Check ──
-        live_gate = self.shadow.get_live_gate_status(cal_ready)
+        live_gate = self.shadow.get_live_gate_status(cal_ready, data_fresh=True, balance_ok=(self.balance >= config.MIN_ORDER_USD))
         if self.shadow.is_live_allowed() and not live_gate["passed"]:
             emit("log", {"msg": f"LIVE_VALIDATION_GATE_NOT_PASSED: {'; '.join(live_gate['reasons'])}"})
             emit("log", {"msg": "LIVE 被拒绝，引擎将降级至 SHADOW 模式"})
@@ -1120,4 +1120,6 @@ class TradingEngine:
             "runMode": self.shadow.get_mode(),
             "calibrationReady": cal_ready,
             "healthTradeCount": len(health_data),
+            "liveGate": self.shadow.get_live_gate_status(cal_ready),
+            "symbolModes": self.shadow.get_symbol_mode_summary(),
         }

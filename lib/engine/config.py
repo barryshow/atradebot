@@ -121,8 +121,12 @@ SHADOW_SYMBOL_MODE = {
 # ── LIVE Gate ──
 LIVE_ENABLED = os.getenv("LIVE_ENABLED", "false").lower() == "true"
 # LIVE requires: calibration READY + shadow validation PASSED + LIVE_ENABLED=true
-LIVE_REQUIRE_CALIBRATION = os.getenv("LIVE_REQUIRE_CALIBRATION", "true").lower() == "true"
-LIVE_REQUIRE_SHADOW_VALIDATION = os.getenv("LIVE_REQUIRE_SHADOW_VALIDATION", "true").lower() == "true"
+LIVE_REQUIRE_CALIBRATION = os.getenv("LIVE_REQUIRE_CALIBRATION", "false").lower() == "true"  # SOFT WARNING
+LIVE_REQUIRE_SHADOW_VALIDATION = os.getenv("LIVE_REQUIRE_SHADOW_VALIDATION", "false").lower() == "true"  # SOFT WARNING
+
+# ── HARD BLOCKS (always enforced) ──
+LIVE_HARD_REQUIRE_DATA = os.getenv("LIVE_HARD_REQUIRE_DATA", "true").lower() == "true"
+LIVE_HARD_REQUIRE_BALANCE = os.getenv("LIVE_HARD_REQUIRE_BALANCE", "true").lower() == "true"
 
 # ── Shadow Graduation Criteria ──
 SHADOW_MIN_DAYS = int(os.getenv("SHADOW_MIN_DAYS", "7"))

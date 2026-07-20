@@ -12,10 +12,13 @@ import { HibtConfigPanel } from "@/app/_components/hibt-config";
 import { RegimeIndicator, EdgePanel, ExpertVotes, ModelHealthPanel } from "@/app/_components/eventedge-panels";
 import { SYMBOLS } from "@/lib/types/engine";
 import type { TradeRecordFlat } from "@/lib/types/candles";
-import type { EdgeResult, MarketRegimeType } from "@/lib/types/engine";
+import type { EdgeResult, MarketRegimeType, RunMode } from "@/lib/types/engine";
+import type { RunModeParam } from "@/lib/hooks/use-engine-control";
+import { useState, useCallback } from "react";
 
 export default function DashboardPage() {
   const { connected, status, symbols, recentTrades, logs, regime, regimeConfidence, expertVotes: sseExpertVotes, edge, modelHealth, calibrationStatus, shadowTrades } = useEngineSSE();
+  const [activeMode, setActiveMode] = useState<RunModeParam>("shadow");
 
   // Flatten trades for chart markers
   const tradeMarkers: TradeRecordFlat[] = recentTrades.map((t) => ({
@@ -40,7 +43,12 @@ export default function DashboardPage() {
       {/* Header with engine control */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <EngineControl state={status.state} />
+          <EngineControl
+            state={status.state}
+            runMode={status.runMode}
+            liveGate={status.liveGate as { passed: boolean; reasons: string[]; checks: Record<string, boolean> } | undefined}
+            onModeChange={setActiveMode}
+          />
           <RegimeIndicator regime={currentRegime} confidence={currentConfidence} />
         </div>
         <div className="flex items-center gap-2">

@@ -31,7 +31,7 @@ export class ProcessManager extends EventEmitter {
     };
   }
 
-  async start(): Promise<{ ok: boolean; error?: string }> {
+  async start(mode?: string): Promise<{ ok: boolean; error?: string }> {
     if (this.process) {
       return { ok: false, error: `Process already exists (state=${this.state})` };
     }
@@ -47,7 +47,7 @@ export class ProcessManager extends EventEmitter {
     const mainPy = path.join(engineDir, "main.py");
 
     try {
-      this.process = spawn(pythonPath, [mainPy], {
+      this.process = spawn(pythonPath, [mainPy, "--auto", "--mode", mode || "shadow"], {
         cwd: path.resolve(process.cwd()),
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, PYTHONUNBUFFERED: "1" },
@@ -89,8 +89,6 @@ export class ProcessManager extends EventEmitter {
         this.emitState();
       });
 
-      // Send start command
-      setTimeout(() => this.sendCommand("start"), 500);
       return { ok: true };
     } catch (err) {
       this.state = "error";

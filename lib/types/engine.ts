@@ -16,6 +16,14 @@ export interface EngineStatus {
   betMode?: string;
   profit?: number;
   runMode?: RunMode;
+  calibrationReady?: boolean;
+  healthTradeCount?: number;
+  liveGate?: {
+    passed: boolean;
+    reasons: string[];
+    checks: Record<string, boolean>;
+  };
+  symbol_modes?: Record<string, string>;
 }
 
 export type EngineEventType =
@@ -40,7 +48,10 @@ export type EngineEventType =
   | "model_health"
   | "trade_rejected"
   | "shadow_trade"
-  | "calibration_status";
+  | "calibration_status"
+  | "decision_cycle"
+  | "funnel"
+  | "emergency_stop";
 
 export interface EngineEvent {
   type: EngineEventType;
