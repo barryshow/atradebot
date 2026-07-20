@@ -157,6 +157,12 @@ def compute_fast_entry_features(
         f["price"] = realtime.price
         f["bid_ask_spread"] = (realtime.ask - realtime.bid) / max(realtime.price, 0.01) if realtime.ask > 0 and realtime.bid > 0 else 0
         f["change_24h"] = realtime.change_pct / 100.0 if realtime.change_pct else 0
+    elif df_1m is not None and len(df_1m) >= 1:
+        # 训练时没有实时 ticker，用最后 1m close 代替
+        c = float(df_1m["close"].values[-1])
+        f["price"] = c
+        f["bid_ask_spread"] = 0.0
+        f["change_24h"] = 0.0
     else:
         f["price"] = 0.0; f["bid_ask_spread"] = 0.0; f["change_24h"] = 0.0
 
