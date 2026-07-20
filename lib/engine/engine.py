@@ -298,7 +298,7 @@ class TradingEngine:
                 symbol=sym, calibrated_probability=fast_prob,  # 用 Fast prob 计算 Edge
                 direction=direction_str, direction_int=direction,
                 expiry_minutes=config.HOLD_MINUTES, entry_price=rt.price,
-                uncertainty_margin=0.02, regime=slow_ctx.get("regime", "RANGE"))
+                uncertainty_margin=0.005, regime=slow_ctx.get("regime", "RANGE"))
 
             cooldown_key = f"{sym}_{direction_str}"
             in_cooldown = (now - self._last_trade_time.get(cooldown_key, 0)) < self._cooldown_seconds
