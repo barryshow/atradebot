@@ -9,6 +9,7 @@ import { LogStream } from "@/app/_components/log-stream";
 import { PnlChart } from "@/app/_components/pnl-chart";
 import { RiskGateVisualizer } from "@/app/_components/risk-gate-visualizer";
 import { HibtConfigPanel } from "@/app/_components/hibt-config";
+import { ManualOrderTest } from "@/app/_components/manual-order-test";
 import { RegimeIndicator, EdgePanel, ExpertVotes, ModelHealthPanel } from "@/app/_components/eventedge-panels";
 import { SYMBOLS } from "@/lib/types/engine";
 import type { TradeRecordFlat } from "@/lib/types/candles";
@@ -60,6 +61,7 @@ export default function DashboardPage() {
           <span className="text-xs text-gray-400">
             {connected ? "已连接" : "断开连接"}
           </span>
+          <ManualOrderTest />
           {/* Calibration status badge */}
           <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${
             calibrationStatus === "READY" ? "bg-green-900/60 text-green-400" : "bg-yellow-900/60 text-yellow-400"

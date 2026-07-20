@@ -195,6 +195,13 @@ function reducer(state: State, action: Action): State {
             recentEvents,
           };
         }
+        case "manual_order_result": {
+          return {
+            ...state,
+            logs: [...state.logs, `[MANUAL_ORDER] ok=${p.ok} order_id=${p.order_id || "N/A"} lifecycle=${p.lifecycle || "N/A"}`].slice(-300),
+            recentEvents,
+          };
+        }
         case "trade_executed": {
           const trade: TradeRecord = {
             ts: evt.ts,

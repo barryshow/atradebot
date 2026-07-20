@@ -51,7 +51,8 @@ export type EngineEventType =
   | "calibration_status"
   | "decision_cycle"
   | "funnel"
-  | "emergency_stop";
+  | "emergency_stop"
+  | "manual_order_result";
 
 export interface EngineEvent {
   type: EngineEventType;
