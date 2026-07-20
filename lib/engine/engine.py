@@ -149,6 +149,7 @@ class TradingEngine:
                 "edge_rejected": f.get("edge_rejected", 0),
                 "edge_passed": f.get("edge_passed", 0),
                 "cooldown_rejected": f.get("cooldown_rejected", 0),
+                "symbol_max_rejected": f.get("symbol_max_rejected", 0),
                 "max_active_rejected": f.get("max_active_rejected", 0),
                 "max_hourly_rejected": f.get("max_hourly_rejected", 0),
                 "candidate_generated": f.get("candidate_generated", 0),
@@ -293,15 +294,28 @@ class TradingEngine:
 
             cooldown_key = f"{sym}_{direction_str}"
             in_cooldown = (now - self._last_trade_time.get(cooldown_key, 0)) < self._cooldown_seconds
-            active_count = len(self.active_trades)
-            max_active = config.MAX_ACTIVE_EVENT_CONTRACTS
+            # 每品种独立限制: 最多 1 个活跃合约
+            active_for_symbol = sum(1 for t in self.active_trades if t.get("symbol") == sym)
+            max_per_symbol = 1
+            # 全局上限
+            total_active = len(self.active_trades)
+            max_global = config.MAX_ACTIVE_EVENT_CONTRACTS
             hourly_count = self._hourly_trade_count.get(sym, 0)
             max_hourly = config.MAX_NEW_TRADES_PER_HOUR
 
             status = "EDGE_PASSED" if edge.passed else "NO_EDGE"
             if in_cooldown: status = "COOLDOWN"
-            if active_count >= max_active: status = "MAX_ACTIVE_TRADES"
+            if active_for_symbol >= max_per_symbol: status = "SYMBOL_AT_MAX"
+            if total_active >= max_global: status = "MAX_ACTIVE_TRADES"
             if hourly_count >= max_hourly: status = "MAX_HOURLY_TRADES"
+
+            # 同品种反方向持仓检查
+            has_opposite = any(
+                t.get("symbol") == sym and t.get("dir") != direction
+                for t in self.active_trades
+            )
+            if has_opposite and not config.ALLOW_OPPOSITE_OVERLAP:
+                status = "OPPOSITE_OVERLAP"
 
             emit("fast_scan", {"symbol": sym, "direction": direction_str,
                 "fast_prob": round(fast_prob, 4), "slow_prob": round(slow_prob, 4),
@@ -309,13 +323,19 @@ class TradingEngine:
                 "effective_edge": round(edge.effective_edge, 4),
                 "break_even": round(edge.break_even_probability, 4),
                 "status": status, "cooldown": in_cooldown,
-                "active_contracts": active_count, "hourly_trades": hourly_count})
+                "active_contracts": total_active,
+                "symbol_active": active_for_symbol,
+                "hourly_trades": hourly_count})
 
             if not edge.passed:
                 self._strat_funnel_count(sym, "edge_rejected"); continue
             if in_cooldown:
                 self._strat_funnel_count(sym, "cooldown_rejected"); continue
-            if active_count >= max_active:
+            if active_for_symbol >= max_per_symbol:
+                self._strat_funnel_count(sym, "symbol_max_rejected"); continue
+            if has_opposite and not config.ALLOW_OPPOSITE_OVERLAP:
+                self._strat_funnel_count(sym, "opposite_rejected"); continue
+            if total_active >= max_global:
                 self._strat_funnel_count(sym, "max_active_rejected"); continue
             if hourly_count >= max_hourly:
                 self._strat_funnel_count(sym, "max_hourly_rejected"); continue
