@@ -141,7 +141,7 @@ MIN_ORDER_USD = int(os.getenv("MIN_ORDER_USD", "3"))           # HIBT 最低下�
 ORDER_AMOUNT_STEP = int(os.getenv("ORDER_AMOUNT_STEP", "1"))   # 必须是整数 USDT
 
 # ── Portfolio Risk ──
-MAX_BET_FRACTION = float(os.getenv("MAX_BET_FRACTION", "0.01"))   # 单笔最大净值比例 (1%)
+MAX_BET_FRACTION = float(os.getenv("MAX_BET_FRACTION", "0.35"))   # 单笔最大净值比例 (35%，小账户如9U时3U=33%)
 MAX_TOTAL_EXPOSURE = float(os.getenv("MAX_TOTAL_EXPOSURE", "0.05"))  # 最大总敞口 (5%)
 MAX_CORRELATED_EXPOSURE = float(os.getenv("MAX_CORRELATED_EXPOSURE", "0.03"))  # 最大关联敞口 (3%)
 DAILY_STOP = float(os.getenv("DAILY_STOP", "0.05"))              # 日亏损限制 (5%)

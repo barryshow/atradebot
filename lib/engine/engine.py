@@ -175,26 +175,7 @@ class TradingEngine:
         self._realtime_feed.start()
         self._load_fast_models()
 
-        cal_ready = self.calibrator.is_ready()
-        cal_status = "READY" if cal_ready else "NOT_READY"
-        if not cal_ready:
-            emit("calibration_status", {"status": "NOT_READY", "msg": "PASSTHROUGH_UNCALIBRATED"})
-
-        live_gate = self.shadow.get_live_gate_status(cal_ready, data_fresh=True,
-            balance_ok=(self.balance >= config.MIN_ORDER_USD))
-        if self.shadow.is_live_allowed() and not live_gate["passed"]:
-            emit("log", {"msg": f"LIVE_VALIDATION_GATE_NOT_PASSED: {'; '.join(live_gate['reasons'])}"})
-            set_run_mode(RunMode.SHADOW); self.shadow = ShadowMode(mode=RunMode.SHADOW)
-            run_mode = "SHADOW"
-
-        sym_modes = self.shadow.get_symbol_mode_summary()
-        active = [s for s, m in sym_modes.items() if m == "SHADOW_ACTIVE"]
-
-        emit("status", {"state": "running", "run_mode": run_mode,
-            "calibration": cal_status, "live_gate": live_gate, "symbol_modes": sym_modes,
-            "fast_scan_interval": config.FAST_SCAN_INTERVAL_SECONDS,
-            "fast_model_loaded": self._fast_model_loaded})
-
+        # ── 先查余额 ──
         self.balance = fetch_balance()
         if self.balance < 0: self.balance = 0.0
         if run_mode == "SHADOW" and self.balance < config.MIN_ORDER_USD:
@@ -203,6 +184,25 @@ class TradingEngine:
         else:
             self._shadow_simulated_balance = False
         self.start_balance = self.balance
+
+        cal_ready = self.calibrator.is_ready()
+        cal_status = "READY" if cal_ready else "NOT_READY"
+        if not cal_ready:
+            emit("calibration_status", {"status": "NOT_READY", "msg": "PASSTHROUGH_UNCALIBRATED"})
+
+        live_gate = self.shadow.get_live_gate_status(cal_ready, data_fresh=True,
+            balance_ok=(self.balance >= config.MIN_ORDER_USD))
+        # 移除自动降级 — 让用户在 LIVE 模式下继续运行，只是不下单
+        if run_mode == "LIVE" and not live_gate["passed"]:
+            emit("log", {"msg": f"LIVE 注意: {'; '.join(live_gate['reasons'])}"})
+
+        sym_modes = self.shadow.get_symbol_mode_summary()
+        active = [s for s, m in sym_modes.items() if m == "SHADOW_ACTIVE"]
+
+        emit("status", {"state": "running", "run_mode": run_mode,
+            "calibration": cal_status, "live_gate": live_gate, "symbol_modes": sym_modes,
+            "fast_scan_interval": config.FAST_SCAN_INTERVAL_SECONDS,
+            "fast_model_loaded": self._fast_model_loaded})
 
         emit("log", {"msg": f"EventEdge V2 Fast Entry | 余额{self.balance:.0f}U | "
             f"扫描{config.FAST_SCAN_INTERVAL_SECONDS}s | Cooldown{self._cooldown_seconds}s | "
