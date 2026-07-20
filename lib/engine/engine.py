@@ -153,10 +153,78 @@ class TradingEngine:
         self._health_trades: list = []  # [{"predicted_prob": float, "result": str, "pnl": float}, ...]
         self._last_health_check = time.time()
 
+        # ── Shadow Funnel 计数器 (Two-tier) ──
+        # System Funnel: ticks, data issues, API errors
+        # Strategy Funnel: bars evaluated, decisions, rejections
+        self._sys_funnel: dict[str, int] = {}        # {stage: count}
+        self._strat_funnel: dict[str, dict[str, int]] = {}  # {symbol: {stage: count}}
+        self._funnel_last_report = time.time()
+        self._last_decision_bar: dict[str, object] = {}  # {symbol: last_bar_ts}
+        self._bars_evaluated_total: dict[str, int] = {}  # {symbol: count}
+
     def set_run_mode(self, mode: str):
         """设置运行模式: live / shadow / backtest"""
         m = RunMode.LIVE if mode == "live" else (RunMode.SHADOW if mode == "shadow" else RunMode.BACKTEST)
         self.shadow = ShadowMode(mode=m)
+
+    def _sys_funnel_count(self, stage: str):
+        """System-level funnel counter"""
+        self._sys_funnel[stage] = self._sys_funnel.get(stage, 0) + 1
+
+    def _strat_funnel_count(self, symbol: str, stage: str):
+        """Strategy-level funnel counter (per symbol)"""
+        if symbol not in self._strat_funnel:
+            self._strat_funnel[symbol] = {}
+        self._strat_funnel[symbol][stage] = self._strat_funnel[symbol].get(stage, 0) + 1
+
+    def _emit_funnel_report(self):
+        """每 60 秒输出一次 Funnel 统计"""
+        now = time.time()
+        if now - self._funnel_last_report < 60:
+            return
+        self._funnel_last_report = now
+
+        # System funnel
+        emit("funnel", {
+            "type": "system",
+            "ticks_total": self._sys_funnel.get("ticks_total", 0),
+            "no_new_bar": self._sys_funnel.get("no_new_bar", 0),
+            "data_not_ready": self._sys_funnel.get("data_not_ready", 0),
+            "warmup_skip": self._sys_funnel.get("warmup_skip", 0),
+            "data_stale": self._sys_funnel.get("data_stale", 0),
+            "api_error": self._sys_funnel.get("api_error", 0),
+        })
+
+        # Strategy funnel per symbol
+        for sym in sorted(self._strat_funnel.keys()):
+            f = self._strat_funnel[sym]
+            last_bar = self._last_decision_bar.get(sym)
+            minutes_since = "N/A"
+            if last_bar is not None:
+                try:
+                    delta = now - (pd.Timestamp(last_bar).timestamp() if hasattr(last_bar, 'timestamp') else 0)
+                    minutes_since = f"{delta/60:.0f}m"
+                except Exception:
+                    pass
+
+            emit("funnel", {
+                "type": "strategy",
+                "symbol": sym,
+                "bars_evaluated_total": self._bars_evaluated_total.get(sym, 0),
+                "last_decision_bar": str(last_bar) if last_bar else "N/A",
+                "minutes_since_last_decision": minutes_since,
+                "regime_detected": f.get("regime_detected", 0),
+                "expert_predicted": f.get("expert_predicted", 0),
+                "edge_rejected": f.get("edge_rejected", 0),
+                "edge_passed": f.get("edge_passed", 0),
+                "candidate_generated": f.get("candidate_generated", 0),
+                "ranker_selected": f.get("selected", 0),
+                "portfolio_risk_rejected": f.get("portfolio_rejected", 0),
+                "portfolio_ok": f.get("portfolio_ok", 0),
+                "shadow_trade_created": f.get("shadow_trade", 0),
+                "observe_only": f.get("observe_only", 0),
+                "settled": f.get("settled", 0),
+            })
 
     def reset_state(self):
         self.running = False
@@ -271,6 +339,11 @@ class TradingEngine:
         EventEdge V2 Stage 1-5: 生成候选交易机会
         Regime → Experts → Meta → Uncertainty → Edge → Candidate
 
+        FEATURE_USES_CLOSED_CANDLES = true
+        - 只使用已收盘的 K 线计算特征（排除 forming candle）
+        - 当前检测到新 bar 时，用上一根已完成 K 线的数据
+        - 与 LightGBM 训练时的数据分布一致
+
         返回 CandidateOpportunity 或 None（如果任何阶段不通过）
         注意：此阶段不执行下单，也不做 Portfolio Risk 检查
         """
@@ -288,30 +361,56 @@ class TradingEngine:
             return None
         df_s.set_index("datetime", inplace=True)
 
+        # ── DATA STALE Protection ──
+        # 如果最新 K 线时间距离当前时间超过 2 个 bar 周期，数据源可能卡死
+        latest_bar_ts = df_s.index[-1]
+        now_ts = pd.Timestamp.now(tz=latest_bar_ts.tz if latest_bar_ts.tz is not None else "UTC")
+        data_age_minutes = (now_ts - latest_bar_ts).total_seconds() / 60
+        max_stale_minutes = config.FEATURE_INTERVAL_MIN * 2  # 2 个 bar 周期
+        if data_age_minutes > max_stale_minutes:
+            self._sys_funnel_count("data_stale")
+            if data_age_minutes > max_stale_minutes * 4:
+                # 只在与上次报告间隔足够时输出，避免日志刷屏
+                emit("log", {"msg": f"DATA_STALE: {symbol} 最新K线 {latest_bar_ts} 距今 {data_age_minutes:.0f}min > {max_stale_minutes}min"})
+            return None
+
+        # ── Bar Detection: 使用 15m 聚合检测新 bar ──
+        # FEATURE_USES_CLOSED_CANDLES: 只使用已完成的 bar
+        # 检测到新 bar 时，exclude 最后一根（可能正在 forming）
         candle_min = config.CANDLE_INTERVAL_MIN
         detect_data = df_s.resample(f"{candle_min}min").agg({
             "open": "first", "high": "max", "low": "min",
             "close": "last", "volume": "sum",
         }).dropna()
+
         if len(detect_data) < 10:
             return None
 
-        current_bar_ts = detect_data.index[-1]
+        # ── 使用倒数第二根已完成 bar 作为决策触发点 ──
+        # 最后一根可能正在 forming，倒数第二根是确定已完成的
+        if len(detect_data) < 2:
+            return None
+        closed_bar_ts = detect_data.index[-2]  # 最后完成的 bar
+        current_bar_ts = detect_data.index[-1]  # 可能正在 forming 的 bar
 
-        if not self._warmup_done.get(symbol, False):
-            self.last_signal_bar_ts[symbol] = current_bar_ts
-            self._warmup_done[symbol] = True
-            emit("log", {"msg": f"预热完成 {symbol}: {current_bar_ts}"})
+        if not self._last_decision_bar.get(symbol):
+            self._last_decision_bar[symbol] = closed_bar_ts
+            emit("log", {"msg": f"预热完成 {symbol}: 最后完成bar={closed_bar_ts}, 当前bar={current_bar_ts}"})
+            self._sys_funnel_count("warmup_skip")
             return None
 
-        if self.last_signal_bar_ts.get(symbol) == current_bar_ts:
+        if self._last_decision_bar.get(symbol) == closed_bar_ts:
+            self._sys_funnel_count("no_new_bar")
             return None
 
+        # ── 新 bar 触发决策！──
+        self._last_decision_bar[symbol] = closed_bar_ts
+        self._bars_evaluated_total[symbol] = self._bars_evaluated_total.get(symbol, 0) + 1
+        self._sys_funnel_count("bars_evaluated")
+
+        # ── 特征计算: 只用已收盘 bar（exclude 最后一根 forming bar）──
         feat_min = config.FEATURE_INTERVAL_MIN
-        feature_data = df_s.resample(f"{feat_min}min").agg({
-            "open": "first", "high": "max", "low": "min",
-            "close": "last", "volume": "sum",
-        }).dropna()
+        feature_data = detect_data.iloc[:-1].copy()  # exclude the forming bar
         if len(feature_data) < 200:
             return None
 
@@ -342,6 +441,7 @@ class TradingEngine:
         # Stage 1: Regime Detection
         # ═══════════════════════════════════════════════════
         regime = self.regime_detector.detect(indicators)
+        self._strat_funnel_count(symbol, "regime_detected")
         emit("regime_update", {
             "symbol": symbol,
             "regime": regime.regime,
@@ -354,6 +454,7 @@ class TradingEngine:
         # Stage 2: Expert Models
         # ═══════════════════════════════════════════════════
         predictions = self.expert_manager.predict_all(symbol, indicators, row)
+        self._strat_funnel_count(symbol, "expert_predicted")
         emit("expert_votes", {
             "symbol": symbol,
             "votes": {p.expert_name: {"prob": p.raw_probability, "dir": p.direction_str}
@@ -404,8 +505,28 @@ class TradingEngine:
             "reject_reason": edge.reject_reason,
         })
 
+        # ── DECISION_CYCLE log ──
+        cal_ready = self.calibrator.is_ready()
+        emit("decision_cycle", {
+            "symbol": symbol,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "bar_timestamp": str(current_bar_ts),
+            "last_closed_bar_timestamp": str(closed_bar_ts),
+            "regime": regime.regime,
+            "raw_probability": round(ensemble.ensemble_probability, 4),
+            "ensemble_probability": round(ensemble.ensemble_probability, 4),
+            "calibration_status": "PASSTHROUGH_UNCALIBRATED" if not cal_ready else "CALIBRATED",
+            "conservative_probability": round(edge.conservative_probability, 4),
+            "payout_ratio": round(edge.net_payout_ratio, 4),
+            "break_even_probability": round(edge.break_even_probability, 4),
+            "effective_edge": round(edge.effective_edge, 4),
+            "passed": edge.passed,
+            "reject_reason": edge.reject_reason or "",
+        })
+
         if not edge.passed:
             reject_reason = edge.reject_reason or "LOW_EDGE"
+            self._strat_funnel_count(symbol, "edge_rejected")
             emit("trade_rejected", {
                 "symbol": symbol,
                 "reason": reject_reason,
@@ -430,6 +551,7 @@ class TradingEngine:
             self.trade_ledger.save(rec)
             return None
 
+        self._strat_funnel_count(symbol, "edge_passed")
         return CandidateOpportunity(
             symbol=symbol,
             direction_str=direction_str,
@@ -469,6 +591,7 @@ class TradingEngine:
         pos = self.portfolio_risk.compute_position_size(edge, self.balance)
 
         if not pos.allowed:
+            self._strat_funnel_count(symbol, "portfolio_rejected")
             emit("trade_rejected", {
                 "symbol": symbol,
                 "reason": pos.reject_reason,
@@ -492,6 +615,7 @@ class TradingEngine:
             return False
 
         stake_usd = pos.stake_usd
+        self._strat_funnel_count(symbol, "portfolio_ok")
 
         # ═══════════════════════════════════════════════════
         # Stage 6b: Portfolio Limits Check
@@ -554,6 +678,7 @@ class TradingEngine:
         # ── Per-symbol activation check ──
         if not self.shadow.is_shadow_active(symbol) and not self.shadow.can_place_order():
             if self.shadow.is_observe_only(symbol):
+                self._strat_funnel_count(symbol, "observe_only")
                 emit("shadow_trade", {
                     "symbol": symbol, "direction": direction_str,
                     "entryPrice": current_price, "amount": 0,
@@ -630,6 +755,7 @@ class TradingEngine:
                 return False
         else:
             # ── SHADOW_ACTIVE: 模拟下单 ──
+            self._strat_funnel_count(symbol, "shadow_trade")
             self.shadow.record_shadow_trade(
                 symbol=symbol, direction=direction_str, direction_int=direction_int,
                 entry_time_ms=current_ts, entry_price=current_price,
@@ -805,6 +931,7 @@ class TradingEngine:
         6. 对选中的候选: _execute_opportunity() → 下单
         """
         current_ts = int(time.time() * 1000)
+        self._sys_funnel_count("ticks_total")
 
         try:
             self._check_settlement()
@@ -851,8 +978,10 @@ class TradingEngine:
                 candidate = self._generate_candidate_v2(s, full_df, current_ts)
                 if candidate is not None:
                     candidates.append(candidate)
+                    self._strat_funnel_count(s, "candidate_generated")
 
             if not candidates:
+                self._emit_funnel_report()
                 return
 
             # ── Record ALL candidates (including rejected) to Shadow ──
@@ -931,6 +1060,12 @@ class TradingEngine:
 
             ranked = self.ranker.rank(edges)
             selected = [o for o in ranked if o.selected]
+            for s in shadow_symbols:
+                self._strat_funnel_count(s, "ranked")
+
+            if selected:
+                for opp in selected:
+                    self._strat_funnel_count(opp.symbol, "selected")
 
             if selected:
                 emit("opportunity_ranked", {
@@ -957,6 +1092,9 @@ class TradingEngine:
                 candidate.position = pos
 
                 self._execute_opportunity(candidate)
+
+            # ── Periodic Funnel Report ──
+            self._emit_funnel_report()
 
         except Exception as e:
             emit("error", {"msg": f"Error: {str(e)[:100]}"})
