@@ -126,6 +126,8 @@ class EdgeResult:
     payout_ratio: float = 0.0               # 总返还比例 (含本金)
     net_payout_ratio: float = 0.0           # 净盈利比例
     payout_source: str = ""                 # "api" / "hardcoded"
+    payout_verified: bool = False           # 仅 API 返回的 payout 才是 verified
+    payout_flag: str = ""                   # "CONFIG_ASSUMED" | "VERIFIED_HIBT"
 
     # Edge
     break_even_probability: float = 0.0     # 盈亏平衡概率
@@ -133,6 +135,7 @@ class EdgeResult:
     raw_edge: float = 0.0                   # 原始优势
     effective_edge: float = 0.0             # 有效优势 (penalty 后)
     expected_roi: float = 0.0               # 每 1U 期望 ROI
+    edge_flag: str = ""                     # "SIMULATED_EDGE" | "VERIFIED_EDGE"
 
     # Margin
     uncertainty_margin: float = 0.0

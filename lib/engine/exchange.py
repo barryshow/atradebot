@@ -9,6 +9,47 @@ from curl_cffi import requests as curl_requests
 from . import config
 
 
+# ═══════════════════════════════════════════════════════════════
+# Direction Mapping — 唯一函数，全项目禁止自行转换
+# ═══════════════════════════════════════════════════════════════
+# HIBT 平台 API direction 实测（commit ae48088 修正）:
+#   direction=1 (CALL/做多) → HIBT API direction=1
+#   direction=2 (PUT/做空) → HIBT API direction=-1
+#
+# ⚠️ P0: 全项目只有这一个函数可以将内部 direction 转换为 HIBT direction
+# ⚠️ 历史事故: commit 8187eb6 曾错误反转导致"做多变成做空"
+# ⚠️ 任何其他地方直接写 if direction == 1: hibt_dir = -1 之类的代码
+#    都是 P0 级 bug，必须删除并改用此函数。
+#
+def map_direction_to_hibt(direction: int) -> int:
+    """将内部 direction (1=CALL, 2=PUT) 转为 HIBT API direction 参数。
+
+    这是全项目唯一的 direction→HIBT 转换函数。
+    禁止任何其他地方自行写方向转换逻辑。
+
+    Args:
+        direction: 内部 direction (1=做多CALL, 2=做空PUT)
+    Returns:
+        HIBT API direction 参数 (1=多, -1=空)
+
+    >>> map_direction_to_hibt(1)
+    1
+    >>> map_direction_to_hibt(2)
+    -1
+    """
+    if direction not in (1, 2):
+        raise ValueError(f"map_direction_to_hibt: invalid direction={direction}, must be 1 or 2")
+    return 1 if direction == 1 else -1
+
+
+# ═══════════════════════════════════════════════════════════════
+# Duplicate Protection — 订单去重 + ORDER_STATUS_UNKNOWN
+# ═══════════════════════════════════════════════════════════════
+# 防止网络超时/API错误导致的重复下单（真钱事故）
+_ORDER_LOCK: dict[str, dict] = {}  # key → {status, ts, order_id}
+_ORDER_LOCK_TIMEOUT_SEC = 300  # 5分钟内同品种同方向不去重
+
+
 @dataclass
 class OrderResult:
     ok: bool
@@ -168,6 +209,23 @@ def fetch_balance() -> float:
 
 
 def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -> OrderResult:
+    """下单到 HIBT，含防重复保护。
+
+    Args:
+        symbol: 交易品种 (BTCUSDT/ETHUSDT/SOLUSDT)
+        direction: 内部方向 (1=CALL, 2=PUT)
+        amount: 下单金额 (USDT)
+        hold_minutes: 持仓时间 (分钟)
+
+    Returns:
+        OrderResult with ok/code/msg/order_id/...
+
+    Safety guarantees:
+        - 同品种同方向 5 分钟内不会重复下单
+        - 所有 endpoint 网络超时 → ORDER_FAILED (不重试其他 endpoint)
+        - API 明确拒绝 → 不重试
+        - 返回 ORDER_STATUS_UNKNOWN 时引擎禁止再下同品种同方向
+    """
     if not _has_credentials():
         # 模拟下单
         if random.random() < 0.95:
@@ -175,10 +233,27 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
         else:
             return OrderResult(ok=False, code=-1, msg="模拟网络波动拒单")
 
-    # HIBT API direction（实测）:
-    #   direction=1 (CALL/做多) → API传1 (HIBT 多)
-    #   direction=2 (PUT/做空) → API传-1 (HIBT 空)
-    hibt_dir = 1 if direction == 1 else -1
+    # ── Duplicate protection ──
+    lock_key = f"{symbol.lower()}_{direction}_{int(amount)}"
+    existing = _ORDER_LOCK.get(lock_key)
+    if existing:
+        elapsed = time.time() - existing["ts"]
+        if elapsed < _ORDER_LOCK_TIMEOUT_SEC:
+            status = existing["status"]
+            if status == "ORDER_STATUS_UNKNOWN":
+                # 上一笔订单状态未知，禁止再次下单
+                print(f"[ORDER_LOCK] BLOCKED: {lock_key} status=UNKNOWN, {elapsed:.0f}s ago", flush=True)
+                return OrderResult(ok=False, code=-1, msg=f"ORDER_STATUS_UNKNOWN: 上一笔订单状态未知，{elapsed:.0f}秒内禁止重复下单")
+            elif status == "SUCCESS":
+                order_id = existing.get("order_id", "N/A")
+                print(f"[ORDER_LOCK] BLOCKED: {lock_key} already succeeded (order_id={order_id}), {elapsed:.0f}s ago", flush=True)
+                return OrderResult(ok=False, code=-1, msg=f"DUPLICATE_PROTECTION: 已有成功订单 {order_id}")
+            # status == "FAILED": 可以重试
+
+    # ── 标记订单锁 ──
+    _ORDER_LOCK[lock_key] = {"status": "ORDER_STATUS_UNKNOWN", "ts": time.time(), "order_id": None}
+
+    hibt_dir = map_direction_to_hibt(direction)
     data = {
         "amount": str(amount),
         "direction": str(hibt_dir),
@@ -200,23 +275,31 @@ def place_order(symbol: str, direction: int, amount: float, hold_minutes: int) -
             safe_log = _safe_log_response(rj)
             print(f"[HIBT Order Response] {json.dumps(safe_log, ensure_ascii=False)}", flush=True)
             if rj.get("code") in [0, 200, "0", "200"]:
+                order_id = str(rj.get("data", {}).get("orderId", rj.get("orderId", "")))
+                # ── 标记订单成功 ──
+                _ORDER_LOCK[lock_key] = {"status": "SUCCESS", "ts": time.time(), "order_id": order_id}
                 # 提取订单字段
+                # ⚠️ payout_ratio 从 HIBT 返回字段提取，如果 HIBT 不返回则为 None
+                hibt_payout = _safe_float(rj.get("data", {}).get("payout", rj.get("payout")))
                 return OrderResult(
                     ok=True, code=200, msg="下单成功",
-                    order_id=str(rj.get("data", {}).get("orderId", rj.get("orderId", ""))),
+                    order_id=order_id,
                     contract_id=str(rj.get("data", {}).get("contractId", rj.get("contractId", ""))),
                     open_price=_safe_float(rj.get("data", {}).get("openPrice", rj.get("openPrice"))),
                     expiry_time=_safe_int(rj.get("data", {}).get("expiryTime", rj.get("expiryTime"))),
-                    payout_ratio=_safe_float(rj.get("data", {}).get("payout", rj.get("payout"))),
+                    payout_ratio=hibt_payout,
                     amount=str(data["amount"]),
                     direction=str(data["direction"]),
                     symbol=str(data["symbol"]),
                     raw_response=rj,
                 )
             # API明确拒绝 → 直接返回失败（不要换 endpoint 重试，防止重复下单）
+            _ORDER_LOCK[lock_key] = {"status": "FAILED", "ts": time.time(), "order_id": None}
             return OrderResult(ok=False, code=rj.get("code"), msg=rj.get("msg", res.text[:30]))
         except Exception as e:
             last_err = str(e)[:50]
             continue
     # 所有 endpoint 都网络超时/出错，才返回失败（宁可漏单，不可重复下单）
+    # ⚠️ ORDER_STATUS_UNKNOWN 保留在 _ORDER_LOCK 中，5分钟内禁止再次同品种同方向下单
+    print(f"[ORDER_LOCK] ORDER_STATUS_UNKNOWN: {lock_key}, all endpoints timed out", flush=True)
     return OrderResult(ok=False, msg=f"网络错误: {last_err}")

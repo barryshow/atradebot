@@ -294,11 +294,13 @@ class TradingEngine:
             if direction == 2:
                 ensemble_prob = max(0.35, 1.0 - ensemble_prob)
 
+            # 方向概率：fast_prob 是 P(CALL)，edge 需要 P(选定方向)
+            edge_prob = fast_prob if direction == 1 else (1.0 - fast_prob)
             edge = self.edge_engine.compute(
-                symbol=sym, calibrated_probability=fast_prob,  # 用 Fast prob 计算 Edge
+                symbol=sym, calibrated_probability=edge_prob,  # 用选定方向的概率
                 direction=direction_str, direction_int=direction,
                 expiry_minutes=config.HOLD_MINUTES, entry_price=rt.price,
-                uncertainty_margin=0.005, regime=slow_ctx.get("regime", "RANGE"))
+                uncertainty_margin=0.015, calibration_margin=0.005, regime=slow_ctx.get("regime", "RANGE"))
 
             cooldown_key = f"{sym}_{direction_str}"
             in_cooldown = (now - self._last_trade_time.get(cooldown_key, 0)) < self._cooldown_seconds
@@ -333,7 +335,10 @@ class TradingEngine:
                 "status": status, "cooldown": in_cooldown,
                 "active_contracts": total_active,
                 "symbol_active": active_for_symbol,
-                "hourly_trades": hourly_count})
+                "hourly_trades": hourly_count,
+                "payout_verified": edge.payout_verified,
+                "payout_flag": edge.payout_flag,
+                "edge_flag": edge.edge_flag})
 
             if not edge.passed:
                 self._strat_funnel_count(sym, "edge_rejected"); continue
@@ -543,10 +548,17 @@ class TradingEngine:
                     "calibratedProbability": edge.calibrated_probability,
                     "effectiveEdge": edge.effective_edge,
                     "expectedRoi": edge.expected_roi,
+                    "edgeFlag": edge.edge_flag,
                     "balance": self.balance, "lifecycle": lifecycle,
                     "open_price_verified": result.open_price is not None,
                     "predicted_entry_price": current_price,
-                    "hibt_open_price": result.open_price})
+                    "hibt_open_price": result.open_price,
+                    # Payout/Settlement verification
+                    "payout_verified": edge.payout_verified,
+                    "payout_flag": edge.payout_flag,
+                    "payout_source": edge.payout_source,
+                    "settlement_verified": False,
+                    "position_size_basis": "BASED_ON_ASSUMED_PAYOUT" if not edge.payout_verified else "BASED_ON_VERIFIED_PAYOUT"})
 
                 self.balance = fetch_balance()
                 if self.balance < 0: self.balance = self.balance - stake_usd
@@ -556,8 +568,21 @@ class TradingEngine:
                 emit("trade_rejected", {"symbol": symbol, "reason": "ORDER_FAILED", "detail": result.msg})
                 return False
         else:
-            # SHADOW_ACTIVE
+            # SHADOW_ACTIVE — 创建真正的影子订单，加入 active_trades 等待结算
             self._strat_funnel_count(symbol, "shadow_trade")
+            trade_id = f"shadow_{int(time.time()*1000)}_{symbol.lower()}_{direction_str.lower()}"
+            shadow_trade = {
+                "symbol": symbol, "dir": direction_int, "direction_str": direction_str,
+                "start_ts": current_ts, "amount": stake_usd,
+                "entry": current_price, "pre_balance": self.balance,
+                "trade_id": trade_id, "hibt_order_id": None,
+                "lifecycle": "SHADOW_ORDER_CREATED",
+                "open_price_verified": False,
+                "predicted_entry_price": current_price,
+                "hibt_open_price": None,
+            }
+            self.active_trades.append(shadow_trade)
+
             self.shadow.record_shadow_trade(
                 symbol=symbol, direction=direction_str, direction_int=direction_int,
                 entry_time_ms=current_ts, entry_price=current_price,
@@ -568,10 +593,15 @@ class TradingEngine:
                 expected_roi=edge.expected_roi,
                 regime=regime.regime if regime else "",
                 expert_votes=ensemble.expert_votes if ensemble else {})
-            emit("shadow_trade", {"symbol": symbol, "direction": direction_str,
-                "entryPrice": current_price, "amount": stake_usd,
+
+            # 更新 shadow balance 模拟
+            if getattr(self, '_shadow_simulated_balance', False):
+                self.balance -= stake_usd
+
+            emit("shadow_order_created", {"symbol": symbol, "direction": direction_str,
+                "trade_id": trade_id, "entryPrice": current_price, "amount": stake_usd,
                 "effectiveEdge": edge.effective_edge, "expectedRoi": edge.expected_roi,
-                "mode": "SHADOW_ACTIVE"})
+                "lifecycle": "SHADOW_ORDER_CREATED"})
             return True
 
     # ═══════════════════════════════════════════════════════════
@@ -591,34 +621,104 @@ class TradingEngine:
             settle_ms = config.HOLD_MINUTES * 60000 + 30000
             if elapsed_ms < settle_ms: continue
 
-            pnl = current_balance - t["pre_balance"]
-            is_win = pnl > 0; is_tie = abs(pnl) < 0.001
-            if is_win: self.total_wins += 1
-            elif not is_tie: self.total_losses += 1
-            self.total_pnl += pnl
-            if not is_tie: self._record_result(is_win)
-            result = "tie" if is_tie else ("win" if is_win else "loss")
+            is_shadow = t.get("lifecycle", "").startswith("SHADOW_ORDER")
 
-            trade_id = t.get("trade_id", "")
-            if trade_id:
-                self.settlement_ledger.estimate_settlement(trade_id=trade_id,
-                    current_balance=current_balance, pre_balance=t["pre_balance"])
-                self.trade_ledger._update_field(trade_id, "settlement_status", "SETTLED_UNVERIFIED")
+            if is_shadow:
+                # ── 影子订单：用当前价格模拟结算 ──
+                # 获取实时价格
+                rt = self._realtime_feed.get_realtime_price(t["symbol"]) if self._realtime_feed else None
+                if rt is None:
+                    # 无法获取价格，用 entry price 作为近似
+                    settle_price = t.get("entry", 0)
+                else:
+                    settle_price = rt.price
 
-            emit("trade_result", {"symbol": t["symbol"], "result": result,
-                "pnl": round(pnl, 4), "trade_id": trade_id,
-                "settlement": "SETTLED_UNVERIFIED",
-                "hibt_order_id": t.get("hibt_order_id"),
-                "open_price_verified": t.get("open_price_verified", False),
-                "predicted_entry_price": t.get("predicted_entry_price"),
-                "hibt_open_price": t.get("hibt_open_price")})
+                if t.get("direction_str") == "CALL":
+                    is_win = settle_price > t.get("entry", 0)
+                else:
+                    is_win = settle_price < t.get("entry", 0)
+                is_tie = abs(settle_price - t.get("entry", 0)) < 0.0001 * t.get("entry", 1)
+
+                # 影子赔付用配置的 payout
+                payout = config.PAYOUT_RATES.get(t["symbol"], 0.80)
+                if is_tie:
+                    pnl = 0.0
+                    result = "TIE"
+                elif is_win:
+                    pnl = t["amount"] * payout
+                    result = "WIN"
+                else:
+                    pnl = -t["amount"]
+                    result = "LOSS"
+
+                t["lifecycle"] = "SHADOW_ORDER_SETTLED"
+                self.balance += pnl
+                if is_win: self.total_wins += 1
+                elif not is_tie: self.total_losses += 1
+                self.total_pnl += pnl
+                if not is_tie: self._record_result(is_win)
+
+                trade_id = t.get("trade_id", "")
+                if trade_id:
+                    self.trade_ledger._update_field(trade_id, "settlement_status", "SHADOW_SETTLED")
+                    self.trade_ledger._update_field(trade_id, "result", result)
+                    self.trade_ledger._update_field(trade_id, "realized_pnl", pnl)
+
+                emit("shadow_order_settled", {"symbol": t["symbol"], "result": result,
+                    "pnl": round(pnl, 4), "trade_id": trade_id,
+                    "settlement": "SHADOW_SETTLED",
+                    "settle_price": settle_price, "entry_price": t.get("entry"),
+                    "lifecycle": "SHADOW_ORDER_SETTLED"})
+            else:
+                # ── 真实订单：余额变化法结算 ──
+                # ⚠️ 不是 HIBT 官方订单级 Settlement，只是余额推断
+                pnl = current_balance - t["pre_balance"]
+                is_win = pnl > 0; is_tie = abs(pnl) < 0.001
+                if is_win: self.total_wins += 1
+                elif not is_tie: self.total_losses += 1
+                self.total_pnl += pnl
+                if not is_tie: self._record_result(is_win)
+                result = "tie" if is_tie else ("win" if is_win else "loss")
+
+                # ── Settlement Ambiguity Detection ──
+                # 统计同时有多少真实订单在结算窗口内
+                real_trade_count = sum(1 for tt in self.active_trades
+                    if not tt.get("lifecycle", "").startswith("SHADOW_ORDER"))
+                settlement_status = "SETTLED_BALANCE_INFERRED"
+                settlement_verified = False
+                # 如果有唯一真实订单且没有其他已知资金变化
+                if real_trade_count == 1:
+                    settlement_label = "BALANCE_INFERRED_SINGLE_ORDER"
+                else:
+                    settlement_label = "SETTLEMENT_AMBIGUOUS"
+
+                trade_id = t.get("trade_id", "")
+                if trade_id:
+                    self.settlement_ledger.estimate_settlement(trade_id=trade_id,
+                        current_balance=current_balance, pre_balance=t["pre_balance"])
+                    self.trade_ledger._update_field(trade_id, "settlement_status", settlement_status)
+                    self.trade_ledger._update_field(trade_id, "settlement_verified", False)
+                    self.trade_ledger._update_field(trade_id, "settlement_label", settlement_label)
+
+                emit("trade_result", {"symbol": t["symbol"], "result": result,
+                    "pnl": round(pnl, 4), "trade_id": trade_id,
+                    "settlement": settlement_label,
+                    "settlement_verified": settlement_verified,
+                    "settlement_status": settlement_status,
+                    "hibt_order_id": t.get("hibt_order_id"),
+                    "open_price_verified": t.get("open_price_verified", False),
+                    "predicted_entry_price": t.get("predicted_entry_price"),
+                    "hibt_open_price": t.get("hibt_open_price")})
 
             self._health_trades.append({"predicted_prob": 0.50, "result": "WIN" if is_win else ("TIE" if is_tie else "LOSS"), "pnl": pnl})
             if len(self._health_trades) > 500: self._health_trades = self._health_trades[-500:]
             self.portfolio_risk.record_pnl(pnl)
             self.active_trades.pop(i)
-            self.balance = current_balance
-            emit("balance_update", {"balance": current_balance})
+            if not is_shadow:
+                current_balance = self.balance
+            else:
+                current_balance = self.balance
+            emit("balance_update", {"balance": self.balance})
 
     def _record_result(self, is_win: bool):
         self.recent_results.append(is_win)

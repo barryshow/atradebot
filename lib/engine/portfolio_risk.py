@@ -103,19 +103,20 @@ class PortfolioRiskManager:
         # ── 4. Small Account Check ──
         min_possible_fraction = self.min_order_usd / equity
         if effective_fraction < min_possible_fraction:
-            # 检查是否允许小资金模式
-            if self.small_account_max_bet_fraction > 0:
-                if min_possible_fraction <= self.small_account_max_bet_fraction:
-                    effective_fraction = min(min_possible_fraction, self.small_account_max_bet_fraction)
-                else:
-                    return PositionSizeResult(
-                        stake_usd=0,
-                        bet_fraction=round(min_possible_fraction, 4),
-                        kelly_fraction=round(kelly, 4),
-                        target_fraction=round(target_fraction, 4),
-                        allowed=False,
-                        reject_reason="ACCOUNT_TOO_SMALL_FOR_RISK_RULE",
-                    )
+            # 小账户：Kelly 理论下注比例低于最低下注额
+            # ⚠️ 禁止自动突破风险上限: 如果 min_possible_fraction > MAX_BET_FRACTION
+            #    直接拒绝，不为满足 3U 最低下注而突破风险上限
+            if min_possible_fraction > self.max_bet_fraction:
+                return PositionSizeResult(
+                    stake_usd=0,
+                    bet_fraction=round(min_possible_fraction, 4),
+                    kelly_fraction=round(kelly, 4),
+                    target_fraction=round(target_fraction, 4),
+                    allowed=False,
+                    reject_reason="ACCOUNT_TOO_SMALL_FOR_RISK_RULE",
+                )
+            if equity >= self.min_order_usd:
+                effective_fraction = min_possible_fraction
             else:
                 return PositionSizeResult(
                     stake_usd=0,
@@ -132,6 +133,12 @@ class PortfolioRiskManager:
         # ── 6. Integer Constraint ──
         integer_stake = int(math.floor(raw_stake))
         integer_stake = (integer_stake // self.order_step) * self.order_step
+
+        # 小账户：如果 min_possible_fraction 刚好是有效下注比例（即 Kelly 为 0 时
+        # 只用最低 3U 下注），浮点误差可能导致 raw_stake=2.9999 → floor=2 → 被拒。
+        # 此时直接取 min_order_usd。
+        if integer_stake < self.min_order_usd and raw_stake >= self.min_order_usd - 0.01:
+            integer_stake = self.min_order_usd
 
         # ── 7. Minimum Order Check ──
         if integer_stake < self.min_order_usd:
@@ -189,12 +196,17 @@ class PortfolioRiskManager:
             for positions in (active_positions or {}).values()
         )
         new_exposure = current_exposure + stake_usd
-        if equity > 0 and new_exposure > equity * self.max_total_exposure:
+        # 小账户：如果最低下单额已超过理论敞口上限，放宽到至少 min_order_usd
+        effective_max_exposure = max(
+            equity * self.max_total_exposure,
+            self.min_order_usd * 1.0,  # 允许至少一单
+        )
+        if equity > 0 and new_exposure > effective_max_exposure:
             return PortfolioCheckResult(
                 allowed=False,
                 reject_reason="PORTFOLIO_LIMIT",
                 current_exposure=current_exposure,
-                max_open_exposure=equity * self.max_total_exposure,
+                max_open_exposure=effective_max_exposure,
             )
 
         # ── 关联敞口检查 ──
@@ -202,7 +214,12 @@ class PortfolioRiskManager:
             sum(p.get("stake_usd", 0) for p in positions if p.get("direction") == direction)
             for positions in (active_positions or {}).values()
         )
-        if equity > 0 and correlated_exposure + stake_usd > equity * self.max_correlated_exposure:
+        # 小账户：放宽到至少允许一单
+        effective_max_correlated = max(
+            equity * self.max_correlated_exposure,
+            self.min_order_usd * 1.0,
+        )
+        if equity > 0 and correlated_exposure + stake_usd > effective_max_correlated:
             return PortfolioCheckResult(
                 allowed=False,
                 reject_reason="CORRELATION_LIMIT",

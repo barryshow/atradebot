@@ -104,10 +104,10 @@ class EdgeEngine:
         direction_int: int,
         expiry_minutes: int = 15,
         entry_price: float = 0.0,
-        uncertainty_margin: float = 0.0,
-        calibration_margin: float = 0.0,
-        model_degradation_margin: float = 0.0,
-        sample_uncertainty_margin: float = 0.0,
+        uncertainty_margin: Optional[float] = None,
+        calibration_margin: Optional[float] = None,
+        model_degradation_margin: Optional[float] = None,
+        sample_uncertainty_margin: Optional[float] = None,
         regime: str = "",
         expert_votes: Optional[Dict] = None,
     ) -> EdgeResult:
@@ -120,14 +120,18 @@ class EdgeEngine:
         # 获取赔付率
         payout = self.contract_discovery.get_payout(symbol, expiry_minutes)
         net_payout_ratio = payout.net_payout_ratio
+        payout_source = payout.source  # "hardcoded" = CONFIG_ASSUMED, not verified
+        payout_verified = (payout_source == "api")  # 只有API返回才是verified
+        payout_flag = "CONFIG_ASSUMED" if payout_source in ("hardcoded", "estimated") else "VERIFIED_HIBT"
 
-        # 使用默认值或传入值
-        unc_margin = uncertainty_margin if uncertainty_margin > 0 else self.default_uncertainty_margin
-        cal_margin = calibration_margin if calibration_margin > 0 else self.default_calibration_margin
-        deg_margin = model_degradation_margin if model_degradation_margin > 0 else self.default_degradation_margin
+        # 使用默认值或传入值（None 表示未传，用默认值）
+        unc_margin = uncertainty_margin if uncertainty_margin is not None else self.default_uncertainty_margin
+        cal_margin = calibration_margin if calibration_margin is not None else self.default_calibration_margin
+        deg_margin = model_degradation_margin if model_degradation_margin is not None else self.default_degradation_margin
+        sample_margin = sample_uncertainty_margin if sample_uncertainty_margin is not None else 0.0
 
         # ── Layer 1: Conservative Probability ──
-        total_margin = unc_margin + cal_margin + deg_margin + sample_uncertainty_margin
+        total_margin = unc_margin + cal_margin + deg_margin + sample_margin
         conservative_prob = max(0.0, min(1.0, calibrated_probability - total_margin))
 
         # ── Layer 2: Expected ROI ──
@@ -164,15 +168,18 @@ class EdgeEngine:
             payout_ratio=round(payout.total_payout_ratio, 4),
             net_payout_ratio=round(net_payout_ratio, 4),
             payout_source=payout.source,
+            payout_verified=payout_verified,
+            payout_flag=payout_flag,
             break_even_probability=round(break_even_prob, 4),
             probability_edge=round(probability_edge, 4),
             raw_edge=round(raw_edge, 4),
             effective_edge=round(effective_edge, 4),
             expected_roi=round(expected_roi, 4),
+            edge_flag="SIMULATED_EDGE" if payout_flag == "CONFIG_ASSUMED" else "VERIFIED_EDGE",
             uncertainty_margin=round(unc_margin, 4),
             calibration_margin=round(cal_margin, 4),
             model_degradation_margin=round(deg_margin, 4),
-            sample_uncertainty_margin=round(sample_uncertainty_margin, 4),
+            sample_uncertainty_margin=round(sample_margin, 4),
             passed=passed,
             reject_reason=reject_reason,
             regime=regime,
