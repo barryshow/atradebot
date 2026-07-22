@@ -104,9 +104,8 @@ class PortfolioRiskManager:
         min_possible_fraction = self.min_order_usd / equity
         if effective_fraction < min_possible_fraction:
             # 小账户：Kelly 理论下注比例低于最低下注额
-            # ⚠️ 禁止自动突破风险上限: 如果 min_possible_fraction > MAX_BET_FRACTION
-            #    直接拒绝，不为满足 3U 最低下注而突破风险上限
-            if min_possible_fraction > self.max_bet_fraction:
+            # 只要有 3U 就允许下最低注，不因 max_bet_fraction 卡死
+            if equity < self.min_order_usd:
                 return PositionSizeResult(
                     stake_usd=0,
                     bet_fraction=round(min_possible_fraction, 4),
@@ -115,17 +114,17 @@ class PortfolioRiskManager:
                     allowed=False,
                     reject_reason="ACCOUNT_TOO_SMALL_FOR_RISK_RULE",
                 )
-            if equity >= self.min_order_usd:
-                effective_fraction = min_possible_fraction
-            else:
-                return PositionSizeResult(
-                    stake_usd=0,
-                    bet_fraction=round(min_possible_fraction, 4),
-                    kelly_fraction=round(kelly, 4),
-                    target_fraction=round(target_fraction, 4),
-                    allowed=False,
-                    reject_reason="ACCOUNT_TOO_SMALL_FOR_RISK_RULE",
-                )
+            # 有 3U 以上 → 直接给最低注
+            raw_stake = self.min_order_usd
+            integer_stake = self.min_order_usd
+            return PositionSizeResult(
+                stake_usd=integer_stake,
+                bet_fraction=round(min_possible_fraction, 4),
+                kelly_fraction=round(kelly, 4),
+                target_fraction=round(target_fraction, 4),
+                allowed=True,
+                reject_reason="",
+            )
 
         # ── 5. 转换为 USDT ──
         raw_stake = equity * effective_fraction

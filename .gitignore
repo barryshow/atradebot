@@ -68,3 +68,4 @@ scripts/start_vps.sh
 
 # local Claude Code workspace
 .claude/
+data/
