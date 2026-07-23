@@ -33,7 +33,9 @@ from .model_health import ModelHealthMonitor, get_model_health_monitor
 from .probability_calibrator import WalkForwardCalibrator
 from .realtime_feed import RealtimeFeed, get_realtime_feed
 from .multi_timeframe_features import (
-    compute_fast_entry_features, FAST_FEATURES, build_fast_feature_vector)
+    compute_fast_entry_features, FAST_FEATURES, build_fast_feature_vector,
+    SR_FEATURES, ALL_FEATURES_B, build_fast_feature_vector_b,
+    compute_sr_features)
 
 
 def emit(event_type: str, payload: dict):
@@ -98,6 +100,7 @@ class TradingEngine:
         self._realtime_feed: Optional[RealtimeFeed] = None
         self._fast_models: Dict[str, object] = {}
         self._fast_scalers: Dict[str, object] = {}
+        self._fast_use_sr: Dict[str, bool] = {}
         self._fast_model_loaded = False
         self._slow_context: Dict[str, dict] = {}
         self._last_slow_update: Dict[str, float] = {}
@@ -208,7 +211,7 @@ class TradingEngine:
             f"扫描{config.FAST_SCAN_INTERVAL_SECONDS}s | Cooldown{self._cooldown_seconds}s | "
             f"MaxTrades/h{config.MAX_NEW_TRADES_PER_HOUR} | "
             f"Active:{','.join(active) if active else 'none'} | "
-            f"FastModel:{'OK' if self._fast_model_loaded else 'NONE'} | "
+            f"FastModel:{'SR' if any(self._fast_use_sr.values()) else 'V1'}" if self._fast_model_loaded else 'NONE'} | "
             f"LIVE:{'ENABLED' if live_gate['passed'] else 'DISABLED'}"})
 
     def stop(self):
@@ -230,12 +233,16 @@ class TradingEngine:
         if not os.path.isdir(model_dir): model_dir = os.path.join(os.getcwd(), "models")
         loaded = 0
         for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+            # 优先加载 SR 增强模型，回退到原模型
             path = os.path.join(model_dir, f"{sym.lower()}_fast_entry.pkl")
             if os.path.exists(path):
                 try:
                     bundle = joblib.load(path)
                     self._fast_models[sym] = bundle["model"]
                     self._fast_scalers[sym] = bundle["scaler"]
+                    # 自动检测特征数量：43 特征 = SR增强，31 特征 = 原版
+                    n_features = len(bundle.get("features", []))
+                    self._fast_use_sr[sym] = (n_features >= 40)
                     loaded += 1
                 except Exception: pass
         self._fast_model_loaded = loaded > 0
@@ -274,10 +281,18 @@ class TradingEngine:
             fast_features = compute_fast_entry_features(
                 sym, rt, df_1m, df_5m, slow_context=self._slow_context.get(sym))
 
+            # SR 特征注入 (Model B)
+            if self._fast_use_sr.get(sym, False):
+                sr_feats = compute_sr_features(df_1m)
+                fast_features.update(sr_feats)
+
             fast_prob = 0.50
             if self._fast_model_loaded and sym in self._fast_models:
                 try:
-                    vec = build_fast_feature_vector(fast_features).reshape(1, -1)
+                    if self._fast_use_sr.get(sym, False):
+                        vec = build_fast_feature_vector_b(fast_features).reshape(1, -1)
+                    else:
+                        vec = build_fast_feature_vector(fast_features).reshape(1, -1)
                     vec_s = self._fast_scalers[sym].transform(vec)
                     proba = self._fast_models[sym].predict_proba(vec_s)
                     pos_idx = 1 if 1 in self._fast_models[sym].classes_ else 0
@@ -765,4 +780,6 @@ class TradingEngine:
             "symbolModes": self.shadow.get_symbol_mode_summary(),
             "fastScanCount": self._fast_scan_count,
             "fastScanInterval": config.FAST_SCAN_INTERVAL_SECONDS,
-            "fastModelLoaded": self._fast_model_loaded}
+            "fastModelLoaded": self._fast_model_loaded,
+            "fastModelType": "SR" if any(self._fast_use_sr.values()) else "V1",
+            "fastFeatures": 43 if any(self._fast_use_sr.values()) else 31}

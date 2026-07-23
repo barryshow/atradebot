@@ -209,3 +209,142 @@ def _regime_to_float(regime: str) -> float:
 def build_fast_feature_vector(features: dict) -> np.ndarray:
     vec = np.array([features.get(name, 0.0) for name in FAST_FEATURES], dtype=np.float64)
     return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ── Support / Resistance Features ──────────────────────────────────────────
+# 所有距离标准化为 (price - reference) / price 或 ATR 归一化
+# Swing High/Low 只用当前 K 线之前已确认的结构（防 Look-Ahead）
+
+SR_FEATURES = [
+    "distance_to_low_60m", "distance_to_low_4h", "distance_to_low_24h",
+    "distance_to_high_60m", "distance_to_high_4h", "distance_to_high_24h",
+    "price_percentile_4h", "price_percentile_24h",
+    "distance_to_recent_swing_low", "distance_to_recent_swing_high",
+    "bars_since_new_low", "bars_since_new_high",
+]
+
+
+def compute_sr_features(df_1m: "pd.DataFrame", n_60m: int = 60, n_4h: int = 240, n_24h: int = 1440) -> dict:
+    """
+    计算支撑/阻力位置特征（纯价格结构，无未来数据）。
+
+    Args:
+        df_1m: 1m K线 DataFrame, 下标为 datetime, 包含 close/high/low
+
+    Returns:
+        特征字典
+    """
+    closes = df_1m["close"].values.astype(float)
+    highs = df_1m["high"].values.astype(float)
+    lows = df_1m["low"].values.astype(float)
+    n = len(closes)
+    f = {}
+    current = closes[-1]
+    eps = 1e-10
+
+    def _safe(key, fn):
+        try:
+            v = float(fn())
+            f[key] = v if np.isfinite(v) else 0.0
+        except:
+            f[key] = 0.0
+
+    # ── 距离 N 周期最低/最高点 ──
+    for window, name_suffix in [(n_60m, "60m"), (n_4h, "4h"), (n_24h, "24h")]:
+        w = min(window, n)
+        if w >= 2:
+            _safe(f"distance_to_low_{name_suffix}",
+                  lambda w=w: (current - np.min(lows[-w:])) / max(current, eps))
+            _safe(f"distance_to_high_{name_suffix}",
+                  lambda w=w: (np.max(highs[-w:]) - current) / max(current, eps))
+
+    # ── 价格百分位 ──
+    for window, name_suffix in [(n_4h, "4h"), (n_24h, "24h")]:
+        w = min(window, n)
+        if w >= 5:
+            _safe(f"price_percentile_{name_suffix}",
+                  lambda w=w: (current - np.min(lows[-w:])) / max(np.max(highs[-w:]) - np.min(lows[-w:]), eps))
+
+    # ── Swing High / Swing Low (防 Look-Ahead) ──
+    # 定义: 传统 fractal 需要 left_bar=2 确认 (i 是低点当 i-2 > i < i-1 且 i+1 > i < i+2)
+    # 在 timestamp T 时只能使用 T-left_bar 之前的已确认 swing
+    # left_bar=2, right_bar=0 (只用已发生的 K 线确认)
+    swing_low_val, swing_high_val, swing_low_bar, swing_high_bar = _find_confirmed_swings(
+        highs, lows, n, left_bar=2
+    )
+
+    if swing_low_val > 0:
+        _safe("distance_to_recent_swing_low",
+              lambda: (current - swing_low_val) / max(current, eps))
+    else:
+        f["distance_to_recent_swing_low"] = 0.0
+
+    if swing_high_val > 0:
+        _safe("distance_to_recent_swing_high",
+              lambda: (swing_high_val - current) / max(current, eps))
+    else:
+        f["distance_to_recent_swing_high"] = 0.0
+
+    # ── bars since new low / high ──
+    _safe("bars_since_new_low",
+          lambda: n - 1 - np.argmin(lows) if np.argmin(lows) < n else 0)
+    _safe("bars_since_new_high",
+          lambda: n - 1 - np.argmax(highs) if np.argmax(highs) < n else 0)
+
+    return f
+
+
+def _find_confirmed_swings(highs: "np.ndarray", lows: "np.ndarray", n: int, left_bar: int = 2):
+    """
+    找到 T 时间点之前已确认的最近 Swing High 和 Swing Low。
+
+    确认规则:
+    当前时间 T 对应 index=n-1 (最新的已收盘 K 线)。
+    只能使用 index <= n-1-left_bar 的已确认高低点
+    (因为确认 swing 需要 left_bar 根后续 K 线)。
+
+    简化版 fractal:
+    swing_high at i:  highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                      highs[i] > highs[i+1] and highs[i] > highs[i+2]
+    swing_low at i:   lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                      lows[i] < lows[i+1] and lows[i] < lows[i+2]
+    """
+    max_i = n - 1 - left_bar  # 最后可以确认的 index
+    if max_i < left_bar:
+        return 0.0, 0.0, -1, -1
+
+    closest_high_val, closest_high_bar = 0.0, -1
+    closest_low_val, closest_low_bar = 0.0, -1
+
+    for i in range(left_bar, max_i + 1):
+        # Swing High check
+        if (i >= 2 and i + 2 < n):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                closest_high_val = highs[i]
+                closest_high_bar = i  # 会被后续的更近的覆盖
+
+        # Swing Low check
+        if (i >= 2 and i + 2 < n):
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                closest_low_val = lows[i]
+                closest_low_bar = i
+
+    return closest_low_val, closest_high_val, closest_low_bar, closest_high_bar
+
+
+def build_sr_feature_vector(features: dict) -> "np.ndarray":
+    """提取 SR 特征为 numpy 数组"""
+    vec = np.array([features.get(name, 0.0) for name in SR_FEATURES], dtype=np.float64)
+    return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# Model B 完整特征 = FAST_FEATURES + SR_FEATURES
+ALL_FEATURES_B = FAST_FEATURES + SR_FEATURES
+
+
+def build_fast_feature_vector_b(features: dict) -> "np.ndarray":
+    """Model B: 原特征 + SR 特征"""
+    vec = np.array([features.get(name, 0.0) for name in ALL_FEATURES_B], dtype=np.float64)
+    return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
