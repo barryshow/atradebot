@@ -211,7 +211,7 @@ class TradingEngine:
             f"扫描{config.FAST_SCAN_INTERVAL_SECONDS}s | Cooldown{self._cooldown_seconds}s | "
             f"MaxTrades/h{config.MAX_NEW_TRADES_PER_HOUR} | "
             f"Active:{','.join(active) if active else 'none'} | "
-            f"FastModel:{'SR' if any(self._fast_use_sr.values()) else 'V1'}" if self._fast_model_loaded else 'NONE'} | "
+            f"FastModel:{'NONE' if not self._fast_model_loaded else ('SR' if any(self._fast_use_sr.values()) else 'V1')} | "
             f"LIVE:{'ENABLED' if live_gate['passed'] else 'DISABLED'}"})
 
     def stop(self):
