@@ -209,12 +209,12 @@ function reducer(state: State, action: Action): State {
             direction: p.direction as "CALL" | "PUT",
             amount: p.amount as number,
             entryPrice: p.entryPrice as number,
-            mlProb: p.mlProb as number,
+            mlProb: (p.rawProbability as number) ?? (p.calibratedProbability as number) ?? 0.5,
             aiApproval: 0,
-            aiReason: p.aiReason as string,
+            aiReason: (p.edgeFlag as string) ?? "",
             riskGates: [],
             result: "pending",
-            flipped: p.flipped as boolean,
+            flipped: false,
           };
           return {
             ...state,
