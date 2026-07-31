@@ -249,6 +249,11 @@ class TradingEngine:
 
     def _run_fast_entry_scan(self):
         now = time.time()
+
+        # 启动 warmup：前 N 秒只收集数据，不下单
+        if now < self._warmup_until:
+            return
+
         if now - self._last_fast_scan < config.FAST_SCAN_INTERVAL_SECONDS:
             return
         self._last_fast_scan = now
@@ -505,13 +510,6 @@ class TradingEngine:
             equity=self.balance, active_positions=active_positions)
         if not port_check.allowed:
             return False
-
-        # ── 启动 warmup：启动后 N 秒内禁止真实下单 ──
-        if self._warmup_until > 0 and time.time() < self._warmup_until:
-            remaining = int(self._warmup_until - time.time())
-            if self.shadow.can_place_order():
-                emit("log", {"msg": f"Warmup: {remaining}s remaining, skipping order for {symbol}"})
-                return False
             # shadow 模式照常记录
 
         if self.shadow.can_place_order():
