@@ -174,7 +174,9 @@ class PortfolioRiskManager:
             PortfolioCheckResult
         """
         # ── 日亏损检查 ──
-        if equity > 0 and self.daily_pnl < -self.daily_stop * equity:
+        # 小账户：日止损阈值至少等于一单最低下注额，避免输一单就永久停摆
+        effective_daily_stop = max(self.daily_stop * equity, self.min_order_usd * 1.0)
+        if equity > 0 and self.daily_pnl < -effective_daily_stop:
             return PortfolioCheckResult(
                 allowed=False,
                 reject_reason="DAILY_STOP",
@@ -182,7 +184,8 @@ class PortfolioRiskManager:
             )
 
         # ── 周回撤检查 ──
-        if equity > 0 and self.weekly_pnl < -self.weekly_drawdown_stop * equity:
+        effective_weekly_stop = max(self.weekly_drawdown_stop * equity, self.min_order_usd * 1.0)
+        if equity > 0 and self.weekly_pnl < -effective_weekly_stop:
             return PortfolioCheckResult(
                 allowed=False,
                 reject_reason="WEEKLY_DRAWDOWN",
