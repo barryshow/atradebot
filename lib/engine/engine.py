@@ -106,6 +106,8 @@ class TradingEngine:
         self._hourly_trade_count: Dict[str, int] = {}
         self._hourly_trade_window_start = time.time()
         self._last_trade_time: Dict[str, float] = {}
+        self._warmup_until: float = 0.0  # 启动后 warmup，期间不下单
+        self._warmup_seconds = 180       # 默认3分钟
         self._cooldown_seconds = config.SIGNAL_COOLDOWN_SECONDS
         self._health_trades: list = []
         self._last_health_check = time.time()
@@ -168,6 +170,7 @@ class TradingEngine:
     def start(self):
         self.reset_state()
         self.running = True
+        self._warmup_until = time.time() + self._warmup_seconds  # 启动 warmup
         run_mode = self.shadow.get_mode()
 
         shadow_symbols = list(self.shadow.get_symbol_mode_summary().keys())
@@ -502,6 +505,14 @@ class TradingEngine:
             equity=self.balance, active_positions=active_positions)
         if not port_check.allowed:
             return False
+
+        # ── 启动 warmup：启动后 N 秒内禁止真实下单 ──
+        if self._warmup_until > 0 and time.time() < self._warmup_until:
+            remaining = int(self._warmup_until - time.time())
+            if self.shadow.can_place_order():
+                emit("log", {"msg": f"Warmup: {remaining}s remaining, skipping order for {symbol}"})
+                return False
+            # shadow 模式照常记录
 
         if self.shadow.can_place_order():
             if self._smoke_test and self._smoke_order_count >= self._smoke_max_orders:
