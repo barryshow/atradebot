@@ -332,7 +332,8 @@ class TradingEngine:
             natr_val = float(fast_features.get("NATR", 0.01))
             in_chop = (adx_val < 18) or (atr_pct < 0.003) or (natr_val < 0.008)
             chop_min_prob = 0.65  # 震荡中要求更高概率门槛
-            if in_chop and edge_prob < chop_min_prob:
+            in_chop_low_prob = in_chop and edge_prob < chop_min_prob
+            if in_chop_low_prob:
                 status = "CHOP_LOW_PROB"
 
             # ── 单币种集中度限制 ──
