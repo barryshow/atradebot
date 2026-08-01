@@ -17,27 +17,37 @@ import atexit
 import tempfile
 
 # ── PID lock ──────────────────────────────────────────────────────────
+# Disabled on Windows — SIGKILL bypasses atexit, causing stale lock files
+_PID_LOCK_ENABLED = os.name != 'nt'
 PID_FILE = os.path.join(tempfile.gettempdir(), "atradebot_engine.pid")
 
 def _acquire_pid_lock() -> bool:
-    """Write PID file with flock semantics. Returns False if another instance is running."""
+    if not _PID_LOCK_ENABLED:
+        return True
     try:
         # Check existing PID
         if os.path.exists(PID_FILE):
             with open(PID_FILE) as f:
-                old_pid = int(f.read().strip())
+                pid_str = f.read().strip()
             try:
-                os.kill(old_pid, 0)  # Signal 0 = test if alive
-                print(f"[PID Lock] Another engine already running (pid={old_pid}), exiting.", flush=True)
-                return False
-            except (OSError, ProcessLookupError):
-                pass  # Stale PID file
+                old_pid = int(pid_str)
+            except (ValueError, TypeError):
+                old_pid = None
+            if old_pid is not None and old_pid != os.getpid():
+                try:
+                    os.kill(old_pid, 0)  # Signal 0 = test if alive
+                    print(f"[PID Lock] Another engine already running (pid={old_pid}), exiting.", flush=True)
+                    return False
+                except (OSError, ProcessLookupError):
+                    pass  # Stale PID file
             os.remove(PID_FILE)
 
         with open(PID_FILE, "w") as f:
             f.write(str(os.getpid()))
     except Exception as e:
         print(f"[PID Lock] Warning: could not write PID file: {e}", flush=True)
+        # On Windows, PID lock is unreliable — allow to proceed
+        pass
     return True
 
 def _release_pid_lock():

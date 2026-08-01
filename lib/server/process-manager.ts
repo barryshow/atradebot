@@ -1,10 +1,12 @@
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, exec, type ChildProcess } from "child_process";
 import { createInterface } from "readline";
 import path from "path";
 import { EventEmitter } from "events";
 import { eventBus } from "./event-bus";
 import { logStore } from "./log-store";
 import type { EngineState, EngineEvent, EngineStatus } from "@/lib/types/engine";
+
+const isWindows = process.platform === "win32";
 
 export class ProcessManager extends EventEmitter {
   private process: ChildProcess | null = null;
@@ -39,38 +41,54 @@ export class ProcessManager extends EventEmitter {
       return { ok: false, error: "Process is being stopped, wait for it to fully exit" };
     }
 
+    // ── Windows: kill stale PID lock before starting ──
+    if (isWindows) {
+      try {
+        exec("del /f /q %TEMP%\\atradebot_engine.pid 2>nul");
+      } catch { /* ok */ }
+    }
+
     let pythonPath = process.env.PYTHON_PATH;
     if (!pythonPath) {
-      pythonPath = process.platform === "win32" ? "python" : "python3";
+      pythonPath = isWindows ? "python" : "python3";
     }
     const engineDir = path.resolve(/* turbopackIgnore: true */ process.cwd(), "lib", "engine");
     const mainPy = path.join(engineDir, "main.py");
 
-    try {
-      this.process = spawn(pythonPath, [mainPy, "--auto", "--mode", mode || "shadow"], {
-        cwd: path.resolve(process.cwd()),
-        stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, PYTHONUNBUFFERED: "1" },
-      });
+    return new Promise((resolve) => {
+      try {
+        this.process = spawn(pythonPath, [mainPy, "--auto", "--mode", mode || "shadow"], {
+          cwd: path.resolve(process.cwd()),
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ...process.env, PYTHONUNBUFFERED: "1", PYTHONIOENCODING: "utf-8" },
+        });
 
-      this.state = "starting";
-      this.startTime = Date.now();
-      this.emitState();
+        this.state = "starting";
+        this.startTime = Date.now();
+        this.emitState();
 
-      // Parse stdout JSON lines
-      const rl = createInterface({ input: this.process.stdout! });
-      rl.on("line", (line) => {
-        try {
-          const event: EngineEvent = JSON.parse(line);
-          this.handleEvent(event);
-          eventBus.emit(event);
-        } catch {
-          logStore.add(`[stdout] ${line}`);
-        }
-      });
+        // Parse stdout JSON lines — force UTF-8 on Windows (avoids GBK decode error)
+        this.process.stdout!.setEncoding("utf-8");
+        const rl = createInterface({ input: this.process.stdout! });
+        let started = false;
+        rl.on("line", (line) => {
+          try {
+            const event: EngineEvent = JSON.parse(line);
+            this.handleEvent(event);
+            eventBus.emit(event);
+            // Resolve when engine reports "running" state for the first time
+            if (!started && event.type === "status" && (event.payload as any).state === "running") {
+              started = true;
+              resolve({ ok: true });
+            }
+          } catch {
+            logStore.add(`[stdout] ${line}`);
+          }
+        });
 
-      // Capture stderr as logs
-      const errRl = createInterface({ input: this.process.stderr! });
+        // Capture stderr as logs
+        this.process.stderr!.setEncoding("utf-8");
+        const errRl = createInterface({ input: this.process.stderr! });
       errRl.on("line", (line) => {
         logStore.add(`[python] ${line}`);
       });
@@ -87,14 +105,23 @@ export class ProcessManager extends EventEmitter {
         logStore.add(`[process] Error: ${err.message}`);
         this.state = "error";
         this.emitState();
+        if (!started) resolve({ ok: false, error: err.message });
       });
 
-      return { ok: true };
+      // Failsafe: resolve after 15s even if "running" event never arrives
+      setTimeout(() => {
+        if (!started) {
+          started = true;
+          logStore.add("[process] Start timeout — engine may still be starting");
+          resolve({ ok: true });
+        }
+      }, 15000);
     } catch (err) {
       this.state = "error";
       this.emitState();
-      return { ok: false, error: String(err) };
+      resolve({ ok: false, error: String(err) });
     }
+    });
   }
 
   async stop(): Promise<{ ok: boolean }> {
@@ -116,12 +143,16 @@ export class ProcessManager extends EventEmitter {
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         try {
-          this.process?.kill("SIGKILL");
+          if (isWindows) {
+            exec(`taskkill /f /pid ${this.process!.pid!} 2>nul`);
+          } else {
+            this.process?.kill("SIGKILL");
+          }
         } catch { /* process already dead */ }
         this.process = null;
         this._stopping = false;
         this.emitState();
-        logStore.add("[process] Stopped via SIGKILL (timeout)");
+        logStore.add(`[process] Stopped via ${isWindows ? "taskkill" : "SIGKILL"} (timeout)`);
         resolve({ ok: true });
       }, 5000);
 
@@ -136,7 +167,6 @@ export class ProcessManager extends EventEmitter {
         resolve({ ok: true });
       };
 
-      // If exit already fired between the check above and now
       if (!proc.killed && proc.exitCode === null) {
         proc.once("exit", cleanup);
       } else {

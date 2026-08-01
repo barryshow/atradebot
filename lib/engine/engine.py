@@ -341,7 +341,9 @@ class TradingEngine:
             if same_sym_count >= 3:
                 status = "SYMBOL_CONCENTRATION"
 
-            status = "EDGE_PASSED" if edge.passed else "NO_EDGE"
+            # Combine all status determination BEFORE emit
+            if not status:  # only set edge status if nothing higher-priority triggered
+                status = "EDGE_PASSED" if edge.passed else "NO_EDGE"
             if in_cooldown: status = "COOLDOWN"
             if active_for_symbol >= max_per_symbol: status = "SYMBOL_AT_MAX"
             if total_active >= max_global: status = "MAX_ACTIVE_TRADES"
