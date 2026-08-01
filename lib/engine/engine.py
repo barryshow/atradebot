@@ -116,6 +116,8 @@ class TradingEngine:
         self._funnel_last_report = time.time()
         self._last_decision_bar: dict[str, object] = {}
         self._bars_evaluated_total: dict[str, int] = {}
+        self._consecutive_same_symbol: dict[str, int] = {}  # 同币种连续交易计数
+        self._last_trade_balance_snapshots: list = []      # 结算前余额快照，用于PnL校验
 
     def set_run_mode(self, mode: str):
         m = RunMode.LIVE if mode == "live" else (RunMode.SHADOW if mode == "shadow" else RunMode.BACKTEST)
@@ -158,6 +160,8 @@ class TradingEngine:
             emit("funnel", {"type": "strategy", "symbol": sym,
                 "edge_rejected": f.get("edge_rejected", 0),
                 "edge_passed": f.get("edge_passed", 0),
+                "chop_rejected": f.get("chop_rejected", 0),
+                "concentration_rejected": f.get("concentration_rejected", 0),
                 "cooldown_rejected": f.get("cooldown_rejected", 0),
                 "symbol_max_rejected": f.get("symbol_max_rejected", 0),
                 "max_active_rejected": f.get("max_active_rejected", 0),
@@ -321,6 +325,22 @@ class TradingEngine:
             hourly_count = self._hourly_trade_count.get(sym, 0)
             max_hourly = config.MAX_NEW_TRADES_PER_HOUR
 
+            # ── 窄幅震荡行情自动降频 ──
+            # 当 ATR% < 0.3%，ADX < 18 或 NATR < 0.008 → 区间震荡，不提方向信号
+            adx_val = float(fast_features.get("ADX", 20))
+            atr_pct = float(fast_features.get("ATR_pct", 1.0))
+            natr_val = float(fast_features.get("NATR", 0.01))
+            in_chop = (adx_val < 18) or (atr_pct < 0.003) or (natr_val < 0.008)
+            chop_min_prob = 0.65  # 震荡中要求更高概率门槛
+            if in_chop and edge_prob < chop_min_prob:
+                status = "CHOP_LOW_PROB"
+
+            # ── 单币种集中度限制 ──
+            # 同一币种连续 3 笔后强制冷却，防止区间震荡中连环亏损
+            same_sym_count = self._consecutive_same_symbol.get(sym, 0)
+            if same_sym_count >= 3:
+                status = "SYMBOL_CONCENTRATION"
+
             status = "EDGE_PASSED" if edge.passed else "NO_EDGE"
             if in_cooldown: status = "COOLDOWN"
             if active_for_symbol >= max_per_symbol: status = "SYMBOL_AT_MAX"
@@ -350,6 +370,10 @@ class TradingEngine:
 
             if not edge.passed:
                 self._strat_funnel_count(sym, "edge_rejected"); continue
+            if in_chop_low_prob:
+                self._strat_funnel_count(sym, "chop_rejected"); continue
+            if same_sym_count >= 3:
+                self._strat_funnel_count(sym, "concentration_rejected"); continue
             if in_cooldown:
                 self._strat_funnel_count(sym, "cooldown_rejected"); continue
             if active_for_symbol >= max_per_symbol:
@@ -399,6 +423,12 @@ class TradingEngine:
             cooldown_key = f"{opp.symbol}_{opp.direction}"
             self._last_trade_time[cooldown_key] = now
             self._hourly_trade_count[opp.symbol] = self._hourly_trade_count.get(opp.symbol, 0) + 1
+            # 同币种连续交易计数（用于集中度限制）
+            self._consecutive_same_symbol[opp.symbol] = self._consecutive_same_symbol.get(opp.symbol, 0) + 1
+            # 其他币种清零（一旦换了币种，集中度重置）
+            for s in list(self._consecutive_same_symbol.keys()):
+                if s != opp.symbol:
+                    self._consecutive_same_symbol[s] = 0
 
     def _update_slow_context(self, sym: str, df_1m: pd.DataFrame):
         """每 15 分钟更新 Slow Context（用 15m K 线真实数据）"""
@@ -681,8 +711,35 @@ class TradingEngine:
             else:
                 # ── 真实订单：余额变化法结算 ──
                 # ⚠️ 不是 HIBT 官方订单级 Settlement，只是余额推断
-                pnl = current_balance - t["pre_balance"]
-                is_win = pnl > 0; is_tie = abs(pnl) < 0.001
+                raw_pnl = current_balance - t["pre_balance"]
+                is_win = raw_pnl > 0; is_tie = abs(raw_pnl) < 0.001
+
+                # ── PnL 合理性校验 ──
+                # 余额变化法容易被前一笔结算的余额波动污染，导致错误 PnL
+                # 例如 stake=3, payout=0.8, WIN 应该是 +2.4，但余额变了 +7.914
+                # 用预设的 net_payout_ratio 计算期望 PnL，如果偏差过大就用期望值
+                stake_amount = t.get("amount", 3)
+                payout_rate = config.PAYOUT_RATES.get(t["symbol"], 0.80)
+                expected_win_pnl = stake_amount * payout_rate   # 赢单应得
+                expected_loss_pnl = -stake_amount               # 输单应亏
+                if is_win and raw_pnl > 0:
+                    if abs(raw_pnl - expected_win_pnl) > max(expected_win_pnl * 0.5, 1.5):
+                        pnl = expected_win_pnl
+                        emit("log", {"msg": f"PnL SANITY: {t['symbol']} {t.get('direction_str','')} "
+                            f"balance_inferred={raw_pnl:.4f} expected_win={expected_win_pnl:.4f} "
+                            f"→ using expected | likely stale pre_balance"})
+                    else:
+                        pnl = raw_pnl
+                elif not is_win and not is_tie:
+                    if abs(raw_pnl - expected_loss_pnl) > max(stake_amount * 0.5, 1.5):
+                        pnl = expected_loss_pnl
+                        emit("log", {"msg": f"PnL SANITY: {t['symbol']} {t.get('direction_str','')} "
+                            f"balance_inferred={raw_pnl:.4f} expected_loss={expected_loss_pnl:.4f} "
+                            f"→ using expected | likely stale pre_balance"})
+                    else:
+                        pnl = raw_pnl
+                else:
+                    pnl = raw_pnl
                 if is_win: self.total_wins += 1
                 elif not is_tie: self.total_losses += 1
                 self.total_pnl += pnl
