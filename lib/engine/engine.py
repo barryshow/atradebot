@@ -795,6 +795,10 @@ class TradingEngine:
             if len(self._health_trades) > 500: self._health_trades = self._health_trades[-500:]
             self.portfolio_risk.record_pnl(pnl)
             self.active_trades.pop(i)
+            # 结算后重置该币种集中度计数器，防止死锁
+            sym = t.get("symbol", "")
+            if sym and self._consecutive_same_symbol.get(sym, 0) >= 3:
+                self._consecutive_same_symbol[sym] = 0
             if not is_shadow:
                 current_balance = self.balance
             else:
