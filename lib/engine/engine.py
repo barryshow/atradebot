@@ -338,6 +338,7 @@ class TradingEngine:
 
             # ── 窄幅震荡行情自动降频 ──
             # 当 ATR% < 0.3%，ADX < 18 或 NATR < 0.008 → 区间震荡，不提方向信号
+            status = ""  # 初始化为空，后续条件限定后覆盖
             adx_val = float(fast_features.get("ADX", 20))
             atr_pct = float(fast_features.get("ATR_pct", 1.0))
             natr_val = float(fast_features.get("NATR", 0.01))
