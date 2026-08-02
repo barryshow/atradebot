@@ -38,8 +38,19 @@ from .multi_timeframe_features import (
 
 def emit(event_type: str, payload: dict):
     event = {"type": event_type, "ts": int(time.time() * 1000), "payload": payload}
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    sys.stdout.write(line)
     sys.stdout.flush()
+    # Debug: also write to file for diagnostics
+    try:
+        _debug_fd = getattr(emit, "_fd", None)
+        if _debug_fd is None:
+            import tempfile as _tmp
+            emit._fd = open(os.path.join(_tmp.gettempdir(), "atradebot_emit.log"), "a", encoding="utf-8")
+        emit._fd.write(line)
+        emit._fd.flush()
+    except Exception:
+        pass
 
 
 def _fuse_probabilities(fast_prob: float, slow_prob: float, features: dict) -> float:
