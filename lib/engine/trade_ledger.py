@@ -430,6 +430,15 @@ class TradeLedger:
         records = self.load_all()
         return records[-n:]
 
+    def get_settled_count(self) -> dict:
+        """返回已结算交易的统计（用于渐进式凯利置信度种子）"""
+        records = self.load_all()
+        settled = [r for r in records if r.result in ("WIN", "LOSS", "TIE")]
+        wins = sum(1 for r in settled if r.result == "WIN")
+        losses = sum(1 for r in settled if r.result == "LOSS")
+        ties = sum(1 for r in settled if r.result == "TIE")
+        return {"wins": wins, "losses": losses, "ties": ties, "total": wins + losses}
+
     def count(self) -> int:
         return len(self.load_all())
 

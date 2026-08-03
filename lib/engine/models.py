@@ -150,6 +150,7 @@ class EdgeResult:
     # 元数据
     regime: str = ""
     expert_votes: dict = field(default_factory=dict)
+    total_trades: int = 0                   # 渐进式凯利用：历史总交易数
 
 
 @dataclass

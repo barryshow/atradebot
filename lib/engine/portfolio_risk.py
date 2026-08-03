@@ -63,6 +63,12 @@ class PortfolioRiskManager:
         self.kelly_fraction = config.KELLY_FRACTION
         self.small_account_max_bet_fraction = config.SMALL_ACCOUNT_MAX_BET_FRACTION
 
+        # ── 渐进式凯利参数 ──
+        self.kelly_full_confidence_trades = config.KELLY_FULL_CONFIDENCE_TRADES
+        self.kelly_max_bet_high = config.KELLY_MAX_BET_HIGH
+        self.kelly_max_bet_low = config.KELLY_MAX_BET_LOW
+        self.kelly_min_confidence = config.KELLY_MIN_CONFIDENCE
+
         # 追踪
         self.daily_pnl: float = 0.0
         self.weekly_pnl: float = 0.0
@@ -76,10 +82,15 @@ class PortfolioRiskManager:
         equity: float,
     ) -> PositionSizeResult:
         """
-        Integer Kelly 仓位计算。
+        渐进式 Integer Kelly 仓位计算。
 
         流程:
-        kelly_fraction → target_fraction → raw_stake → integer_stake → min_order_check
+        confidence → scaled_kelly → target_fraction → dynamic_cap → raw_stake → integer_stake
+
+        渐进式: 样本少时保守，样本多时渐进接近理论值
+        - confidence = min(1.0, total_trades / 500)
+        - kelly_fraction = half_kelly × max(min_confidence, confidence)
+        - max_bet = max_bet_low + (max_bet_high - max_bet_low) × confidence
 
         Returns:
             PositionSizeResult
@@ -87,24 +98,42 @@ class PortfolioRiskManager:
         if equity <= 0:
             return PositionSizeResult(reject_reason="ACCOUNT_TOO_SMALL_FOR_RISK_RULE")
 
+        # ── 0. 渐进置信度 ──
+        confidence = min(1.0, max(self.kelly_min_confidence,
+                                   edge_result.total_trades / self.kelly_full_confidence_trades))
+
         # ── 1. 理论 Kelly ──
-        # kelly = (p * (1 + r) - 1) / r
-        # 其中 r = net_payout_ratio
         r = edge_result.net_payout_ratio
         p = edge_result.conservative_probability
         kelly = max(0.0, (p * (1.0 + r) - 1.0) / r) if r > 0 else 0.0
 
-        # ── 2. Fractional Kelly ──
-        target_fraction = self.kelly_fraction * kelly
+        # ── 2. 渐进 Fractional Kelly ──
+        # 样本少 → 保守衰减；样本多 → 接近半凯利
+        scaled_kelly_fraction = self.kelly_fraction * confidence
+        target_fraction = scaled_kelly_fraction * kelly
 
-        # ── 3. Hard Cap ──
-        effective_fraction = min(target_fraction, self.max_bet_fraction)
+        # ── 3. 动态 Hard Cap ──
+        # 仓位上限随着样本增加从 3% 渐进到 8%
+        dynamic_max_bet = self.kelly_max_bet_low + (
+            self.kelly_max_bet_high - self.kelly_max_bet_low) * confidence
+        effective_fraction = min(target_fraction, dynamic_max_bet)
 
-        # ── 4. Small Account Check ──
+        # ── 4. 弱Edge币种 (Kelly<1%) 自动过滤到最低注 ──
+        weak_edge_filter = kelly < 0.01 and confidence < 0.5
+        if weak_edge_filter:
+            # 样本少 + Kelly 低 → 这个币种不值得下注，跳过
+            return PositionSizeResult(
+                stake_usd=0,
+                bet_fraction=round(effective_fraction, 4),
+                kelly_fraction=round(kelly, 4),
+                target_fraction=round(target_fraction, 4),
+                allowed=False,
+                reject_reason="LOW_EDGE_NO_CONFIDENCE",
+            )
+
+        # ── 5. Small Account Check ──
         min_possible_fraction = self.min_order_usd / equity
         if effective_fraction < min_possible_fraction:
-            # 小账户：Kelly 理论下注比例低于最低下注额
-            # 只要有 3U 就允许下最低注，不因 max_bet_fraction 卡死
             if equity < self.min_order_usd:
                 return PositionSizeResult(
                     stake_usd=0,
@@ -114,7 +143,7 @@ class PortfolioRiskManager:
                     allowed=False,
                     reject_reason="ACCOUNT_TOO_SMALL_FOR_RISK_RULE",
                 )
-            # 有 3U 以上 → 直接给最低注
+            # 有足够钱，给最低注 3U
             raw_stake = self.min_order_usd
             integer_stake = self.min_order_usd
             return PositionSizeResult(
@@ -126,20 +155,17 @@ class PortfolioRiskManager:
                 reject_reason="",
             )
 
-        # ── 5. 转换为 USDT ──
+        # ── 6. 转换为 USDT ──
         raw_stake = equity * effective_fraction
 
-        # ── 6. Integer Constraint ──
+        # ── 7. Integer Constraint ──
         integer_stake = int(math.floor(raw_stake))
         integer_stake = (integer_stake // self.order_step) * self.order_step
 
-        # 小账户：如果 min_possible_fraction 刚好是有效下注比例（即 Kelly 为 0 时
-        # 只用最低 3U 下注），浮点误差可能导致 raw_stake=2.9999 → floor=2 → 被拒。
-        # 此时直接取 min_order_usd。
         if integer_stake < self.min_order_usd and raw_stake >= self.min_order_usd - 0.01:
             integer_stake = self.min_order_usd
 
-        # ── 7. Minimum Order Check ──
+        # ── 8. Minimum Order Check ──
         if integer_stake < self.min_order_usd:
             return PositionSizeResult(
                 stake_usd=integer_stake,

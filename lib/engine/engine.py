@@ -193,6 +193,9 @@ class TradingEngine:
         self._realtime_feed.start()
         self._load_fast_models()
 
+        # ── 从 ledger 加载历史交易数（渐进式凯利置信度种子） ──
+        self._seed_progressive_kelly_from_ledger()
+
         # ── 先查余额 ──
         self.balance = fetch_balance()
         if self.balance < 0: self.balance = 0.0
@@ -242,6 +245,21 @@ class TradingEngine:
         self.paused = False; self.halted = False
         self.pause_until = 0; self.consecutive_losses = 0
         emit("status", {"state": "running"})
+
+    def _seed_progressive_kelly_from_ledger(self):
+        """从 ledger 加载已结算交易数作为渐进凯利的置信度种子"""
+        try:
+            settled = self.trade_ledger.get_settled_count()
+            if settled > 0:
+                self.total_wins = settled.get("wins", 0)
+                self.total_losses = settled.get("losses", 0)
+                total = self.total_wins + self.total_losses
+                confidence = min(1.0, total / config.KELLY_FULL_CONFIDENCE_TRADES)
+                confidence_pct = round(confidence * 100, 1)
+                emit("log", {"msg": f"渐进凯利: 从ledger加载{total}笔历史 (W{self.total_wins}/L{self.total_losses}), "
+                    f"置信度{confidence_pct}%"})
+        except Exception:
+            pass
 
     def _load_fast_models(self):
         model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models")
@@ -324,6 +342,8 @@ class TradingEngine:
                 direction=direction_str, direction_int=direction,
                 expiry_minutes=config.HOLD_MINUTES, entry_price=rt.price,
                 uncertainty_margin=0.015, calibration_margin=0.005, regime=slow_ctx.get("regime", "RANGE"))
+            # 注入历史交易数（渐进式凯利用）
+            edge.total_trades = self.total_wins + self.total_losses
 
             cooldown_key = f"{sym}_{direction_str}"
             in_cooldown = (now - self._last_trade_time.get(cooldown_key, 0)) < self._cooldown_seconds

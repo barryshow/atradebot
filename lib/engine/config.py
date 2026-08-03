@@ -147,6 +147,13 @@ MAX_CORRELATED_EXPOSURE = float(os.getenv("MAX_CORRELATED_EXPOSURE", "0.03"))  #
 DAILY_STOP = float(os.getenv("DAILY_STOP", "0.05"))              # 日亏损限制 (5%)
 WEEKLY_DRAWDOWN_STOP = float(os.getenv("WEEKLY_DRAWDOWN_STOP", "0.10"))  # 周回撤限制 (10%)
 
+# ── 渐进式凯利 (Progressive Kelly) ──
+# 样本少时保守（置信度低），样本多时渐进接近理论凯利
+KELLY_FULL_CONFIDENCE_TRADES = int(os.getenv("KELLY_FULL_CONFIDENCE_TRADES", "500"))  # 500笔完全信任统计
+KELLY_MAX_BET_HIGH = float(os.getenv("KELLY_MAX_BET_HIGH", "0.08"))   # 500笔后的仓位上限 (8%)
+KELLY_MAX_BET_LOW = float(os.getenv("KELLY_MAX_BET_LOW", "0.03"))     # 初始仓位上限 (3%)
+KELLY_MIN_CONFIDENCE = float(os.getenv("KELLY_MIN_CONFIDENCE", "0.25"))  # 最低置信度底限
+
 # ── Small Account ──
 SMALL_ACCOUNT_MAX_BET_FRACTION = float(os.getenv("SMALL_ACCOUNT_MAX_BET_FRACTION", "0.0"))  # 0=禁止自动放宽
 
