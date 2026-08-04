@@ -5,10 +5,7 @@ import type {
   EngineStatus,
   SymbolSnapshot,
   TradeRecord,
-  RiskGateResult,
   MarketRegimeType,
-  EdgeResult,
-  RejectReasonCode,
 } from "@/lib/types/engine";
 
 interface State {
@@ -18,15 +15,18 @@ interface State {
   recentTrades: TradeRecord[];
   recentEvents: EngineEvent[];
   logs: string[];
-  // EventEdge V2
   regime: Record<string, MarketRegimeType>;
   regimeConfidence: Record<string, number>;
   expertVotes: Record<string, Record<string, number>>;
-  edge: Record<string, Partial<EdgeResult>>;
+  edge: Record<string, Record<string, unknown>>;
   modelHealth: Record<string, unknown>;
   calibrationStatus: string;
   lastRejected: Array<{ symbol: string; reason: string; detail?: string }>;
   shadowTrades: Array<Record<string, unknown>>;
+  // v6 new fields
+  fastScans: Array<Record<string, unknown>>;
+  settlementAvailable: boolean;
+  payoutAvailable: boolean;
 }
 
 type Action =
@@ -42,7 +42,7 @@ const initialStatus: EngineStatus = {
   wins: 0,
   losses: 0,
   activeTrades: 0,
-  maxConcurrentTrades: 3,
+  maxConcurrentTrades: 1,
   balance: 0,
   lastTick: null,
 };
@@ -62,6 +62,9 @@ const initialState: State = {
   calibrationStatus: "NOT_READY",
   lastRejected: [],
   shadowTrades: [],
+  fastScans: [],
+  settlementAvailable: false,
+  payoutAvailable: false,
 };
 
 function reducer(state: State, action: Action): State {
@@ -78,7 +81,13 @@ function reducer(state: State, action: Action): State {
       switch (evt.type) {
         case "status": {
           const newStatus = { ...state.status, ...(p as Partial<EngineStatus>) };
-          return { ...state, status: newStatus, recentEvents };
+          return {
+            ...state,
+            status: newStatus,
+            settlementAvailable: (p as Record<string, unknown>).settlement_available as boolean ?? state.settlementAvailable,
+            payoutAvailable: (p as Record<string, unknown>).payout_available as boolean ?? state.payoutAvailable,
+            recentEvents,
+          };
         }
         case "features": {
           const sym = p.symbol as string;
@@ -108,7 +117,38 @@ function reducer(state: State, action: Action): State {
             recentEvents,
           };
         }
-        // ── EventEdge V2 Events ──
+        // ── v6: Fast scan with EV ──
+        case "fast_scan": {
+          const sym = p.symbol as string;
+          const scan = {
+            symbol: sym,
+            direction: p.direction as string,
+            fastProb: p.fast_prob as number,
+            slowProb: p.slow_prob as number,
+            calibratedProb: p.calibrated_prob as number,
+            evCall: p.ev_call as number,
+            evPut: p.ev_put as number,
+            selectedEv: p.selected_ev as number,
+            status: p.status as string,
+            payoutSource: p.payout_source as string,
+            activeContracts: p.active_contracts as number,
+            ts: evt.ts,
+          };
+          return {
+            ...state,
+            fastScans: [...state.fastScans, scan].slice(-100),
+            symbols: {
+              ...state.symbols,
+              [sym]: {
+                ...state.symbols[sym],
+                symbol: sym,
+                mlProb: scan.fastProb,
+                direction: scan.direction as "CALL" | "PUT" | null,
+              },
+            },
+            recentEvents,
+          };
+        }
         case "regime_update": {
           const sym = p.symbol as string;
           return {
@@ -126,55 +166,12 @@ function reducer(state: State, action: Action): State {
           const sym = p.symbol as string;
           const votes = p.votes as Record<string, { prob: number; dir: string }>;
           const voteMap: Record<string, number> = {};
-          for (const [name, v] of Object.entries(votes)) {
+          for (const [name, v] of Object.entries(votes || {})) {
             voteMap[name] = v.prob;
           }
           return {
             ...state,
             expertVotes: { ...state.expertVotes, [sym]: voteMap },
-            recentEvents,
-          };
-        }
-        case "edge_calculation": {
-          const sym = p.symbol as string;
-          return {
-            ...state,
-            edge: {
-              ...state.edge,
-              [sym]: {
-                calibratedProbability: p.calibrated_probability as number,
-                conservativeProbability: p.conservative_probability as number,
-                breakEvenProbability: p.break_even_probability as number,
-                effectiveEdge: p.effective_edge as number,
-                expectedRoi: p.expected_roi as number,
-                passed: p.passed as boolean,
-                rejectReason: (p.reject_reason as RejectReasonCode) || "",
-              },
-            },
-            recentEvents,
-          };
-        }
-        case "model_health": {
-          return {
-            ...state,
-            modelHealth: {
-              ...state.modelHealth,
-              window: p.window as number,
-              isDegraded: p.is_degraded as boolean,
-              actualWinRate: p.actual_win_rate as number,
-              predictedWinRate: p.predicted_win_rate as number,
-              winRateDelta: p.win_rate_delta as number,
-              brierScore: p.brier_score as number,
-              ece: (p as Record<string, unknown>).ece as number,
-              tradeCount: (p as Record<string, unknown>).trade_count as number,
-            },
-            recentEvents,
-          };
-        }
-        case "calibration_status": {
-          return {
-            ...state,
-            calibrationStatus: (p.status as string) || "NOT_READY",
             recentEvents,
           };
         }
@@ -188,6 +185,8 @@ function reducer(state: State, action: Action): State {
             recentEvents,
           };
         }
+        // ── v6 shadow events ──
+        case "shadow_order_created":
         case "shadow_trade": {
           return {
             ...state,
@@ -195,10 +194,10 @@ function reducer(state: State, action: Action): State {
             recentEvents,
           };
         }
-        case "manual_order_result": {
+        case "shadow_order_settled": {
           return {
             ...state,
-            logs: [...state.logs, `[MANUAL_ORDER] ok=${p.ok} order_id=${p.order_id || "N/A"} lifecycle=${p.lifecycle || "N/A"}`].slice(-300),
+            shadowTrades: [...state.shadowTrades, { ...p, ts: evt.ts, settled: true }].slice(-100),
             recentEvents,
           };
         }
@@ -208,10 +207,10 @@ function reducer(state: State, action: Action): State {
             symbol: p.symbol as string,
             direction: p.direction as "CALL" | "PUT",
             amount: p.amount as number,
-            entryPrice: p.entryPrice as number,
-            mlProb: (p.rawProbability as number) ?? (p.calibratedProbability as number) ?? 0.5,
+            entryPrice: (p.entryPrice as number) ?? (p.entry_price as number) ?? 0,
+            mlProb: (p.ev as number) ?? (p.calibratedProbability as number) ?? 0.5,
             aiApproval: 0,
-            aiReason: (p.edgeFlag as string) ?? "",
+            aiReason: `EV=${((p.ev as number) ?? 0).toFixed(4)}`,
             riskGates: [],
             result: "pending",
             flipped: false,
@@ -223,30 +222,13 @@ function reducer(state: State, action: Action): State {
           };
         }
         case "trade_result": {
-          const sym = p.symbol as string;
-          const trades = state.recentTrades.map((t) =>
-            t.symbol === sym && t.result === "pending"
-              ? { ...t, result: p.result as "win" | "loss", pnl: p.pnl as number, exitPrice: p.exitPrice as number }
+          const tid = p.trade_id as string;
+          const trades = state.recentTrades.map((t, idx) =>
+            t.result === "pending" && state.recentTrades.length - idx <= 20
+              ? { ...t, result: (p.result as "win" | "loss") || "pending", pnl: p.pnl as number }
               : t
           );
           return { ...state, recentTrades: trades, recentEvents };
-        }
-        case "signal_flip": {
-          const sym = p.symbol as string;
-          const dir = p.newDirection === 1 ? "CALL" : "PUT";
-          return {
-            ...state,
-            symbols: {
-              ...state.symbols,
-              [sym]: {
-                ...state.symbols[sym],
-                symbol: sym,
-                direction: dir as "CALL" | "PUT",
-                mlProb: p.newProb as number,
-              },
-            },
-            recentEvents,
-          };
         }
         case "balance_update":
           return {
@@ -254,23 +236,27 @@ function reducer(state: State, action: Action): State {
             status: { ...state.status, balance: p.balance as number },
             recentEvents,
           };
-        case "candle_update": {
-          const sym = p.symbol as string;
-          return {
-            ...state,
-            symbols: {
-              ...state.symbols,
-              [sym]: { ...state.symbols[sym], symbol: sym, price: p.close as number },
-            },
-            recentEvents,
-          };
-        }
         case "log":
           return {
             ...state,
             logs: [...state.logs, p.msg as string].slice(-300),
             recentEvents,
           };
+        case "funnel": {
+          // Funnel data is informational, log it
+          const ft = p.type as string;
+          if (ft === "strategy") {
+            return {
+              ...state,
+              logs: [
+                ...state.logs,
+                `[FUNNEL ${p.symbol}] passed=${p.decision_passed || 0} reject_ev=${p.reject_insufficient_ev || 0} shadow=${p.shadow_trade || 0}`,
+              ].slice(-300),
+              recentEvents,
+            };
+          }
+          return { ...state, recentEvents };
+        }
         default:
           return { ...state, recentEvents };
       }
@@ -312,7 +298,6 @@ export function useEngineSSE() {
       dispatch({ type: "disconnected" });
       es.close();
       esRef.current = null;
-      // Reconnect with backoff
       reconnectTimer.current = setTimeout(() => {
         backoff.current = Math.min(backoff.current * 2, 30000);
         connect();

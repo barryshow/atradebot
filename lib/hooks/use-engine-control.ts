@@ -1,7 +1,7 @@
 "use client";
 import { useState, useCallback } from "react";
 
-export type RunModeParam = "live" | "shadow" | "backtest";
+export type RunModeParam = "paper" | "shadow" | "live";
 
 export function useEngineControl() {
   const [loading, setLoading] = useState(false);
@@ -30,6 +30,6 @@ export function useEngineControl() {
     stop: () => sendAction("stop"),
     pause: () => sendAction("pause"),
     resume: () => sendAction("resume"),
-    emergencyStop: () => sendAction("stop", "live"), // force stop regardless of mode
+    emergencyStop: () => sendAction("stop"),
   };
 }

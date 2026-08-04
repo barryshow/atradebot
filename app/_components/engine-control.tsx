@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useEngineControl, type RunModeParam } from "@/lib/hooks/use-engine-control";
-import type { EngineState } from "@/lib/types/engine";
+import type { EngineState, LiveGateStatus } from "@/lib/types/engine";
 
 const stateLabels: Record<EngineState, string> = {
   stopped: "已停止",
@@ -11,11 +11,11 @@ const stateLabels: Record<EngineState, string> = {
   error: "异常",
 };
 
-interface LiveGateStatus {
-  passed: boolean;
-  reasons: string[];
-  checks: Record<string, boolean>;
-}
+const modeBadge: Record<string, { label: string; color: string }> = {
+  PAPER: { label: "📝 PAPER", color: "bg-blue-900/60 text-blue-400" },
+  SHADOW: { label: "🟡 SHADOW", color: "bg-yellow-900/60 text-yellow-400" },
+  LIVE: { label: "🔴 LIVE", color: "bg-red-900/60 text-red-400 animate-pulse" },
+};
 
 export function EngineControl({
   state,
@@ -25,7 +25,7 @@ export function EngineControl({
 }: {
   state: EngineState;
   runMode?: string;
-  liveGate?: LiveGateStatus;
+  liveGate?: LiveGateStatus | null;
   onModeChange?: (mode: RunModeParam) => void;
 }) {
   const { loading, start, stop, pause, resume } = useEngineControl();
@@ -34,9 +34,10 @@ export function EngineControl({
   const handleStart = () => {
     if (selectedMode === "live") {
       if (!liveGate?.passed) {
+        const blocks = liveGate?.hard_blocks?.map((r: string) => `  ❌ ${r}`).join("\n") || liveGate?.reasons?.map((r: string) => `  ❌ ${r}`).join("\n") || "";
         const confirmed = confirm(
           "⚠️ LIVE 门控未全部通过:\n\n" +
-            liveGate?.reasons.map((r) => `  ❌ ${r}`).join("\n") +
+            blocks +
             "\n\n高风险: 确定要继续启动 LIVE 吗？"
         );
         if (!confirmed) return;
@@ -55,6 +56,7 @@ export function EngineControl({
 
   const isLive = runMode === "LIVE";
   const isRunning = state === "running";
+  const badge = modeBadge[runMode || ""] || modeBadge.SHADOW;
 
   return (
     <div className="flex flex-col gap-2">
@@ -74,14 +76,8 @@ export function EngineControl({
 
         {/* Mode badge */}
         {runMode && (
-          <span
-            className={`text-xs font-bold px-1.5 py-0.5 rounded ${
-              isLive
-                ? "bg-red-900/60 text-red-400 animate-pulse"
-                : "bg-yellow-900/60 text-yellow-400"
-            }`}
-          >
-            {isLive ? "🔴 LIVE" : "🟡 SHADOW"}
+          <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${badge.color}`}>
+            {badge.label}
           </span>
         )}
       </div>
@@ -94,6 +90,7 @@ export function EngineControl({
             onChange={(e) => setSelectedMode(e.target.value as RunModeParam)}
             className="px-2 py-1.5 text-sm rounded bg-gray-800 border border-gray-700 text-white"
           >
+            <option value="paper">PAPER (回测)</option>
             <option value="shadow">SHADOW (模拟)</option>
             <option value="live">LIVE (实盘)</option>
           </select>
@@ -107,10 +104,16 @@ export function EngineControl({
             className={`px-3 py-1.5 text-sm font-medium rounded text-white disabled:opacity-50 ${
               selectedMode === "live"
                 ? "bg-red-600 hover:bg-red-500"
+                : selectedMode === "paper"
+                ? "bg-blue-600 hover:bg-blue-500"
                 : "bg-green-600 hover:bg-green-500"
             }`}
           >
-            {selectedMode === "live" ? "🔴 启动 LIVE" : "启动 SHADOW"}
+            {selectedMode === "live"
+              ? "🔴 启动 LIVE"
+              : selectedMode === "paper"
+              ? "📝 启动 PAPER"
+              : "启动 SHADOW"}
           </button>
         )}
         {state === "running" && (
@@ -141,7 +144,7 @@ export function EngineControl({
           </button>
         )}
 
-        {/* Emergency stop — always visible when running */}
+        {/* Emergency stop */}
         {isRunning && (
           <button
             onClick={handleEmergencyStop}
@@ -153,19 +156,34 @@ export function EngineControl({
       </div>
 
       {/* LIVE Gate status */}
-      {isLive && liveGate && !liveGate.passed && (
+      {liveGate && !liveGate.passed && (
         <div className="bg-red-900/30 border border-red-800 rounded p-2 mt-1">
-          <div className="text-xs text-red-400 font-medium mb-1">LIVE BLOCKED:</div>
-          {liveGate.reasons.map((r, i) => (
+          <div className="text-xs text-red-400 font-medium mb-1">LIVE BLOCKED ({liveGate.hard_blocks?.length || liveGate.reasons?.length || 0} reasons):</div>
+          {(liveGate.hard_blocks || liveGate.reasons || []).map((r, i) => (
             <div key={i} className="text-xs text-red-300 ml-2">
               ❌ {r}
             </div>
           ))}
+          {liveGate.soft_warnings?.map((w, i) => (
+            <div key={`w-${i}`} className="text-xs text-yellow-300 ml-2">
+              ⚠️ {w}
+            </div>
+          ))}
+          {/* Show checks detail */}
+          {liveGate.checks && (
+            <div className="mt-2 border-t border-red-800/50 pt-1">
+              {Object.entries(liveGate.checks).map(([k, v]) => (
+                <div key={k} className="text-xs text-gray-500 ml-2">
+                  {v ? "✅" : "❌"} {k}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
-      {isLive && liveGate?.passed && (
+      {liveGate?.passed && (
         <div className="bg-green-900/30 border border-green-800 rounded p-2 mt-1">
-          <div className="text-xs text-green-400 font-medium">✅ LIVE READY</div>
+          <div className="text-xs text-green-400 font-medium">✅ LIVE READY — All gates passed</div>
         </div>
       )}
     </div>

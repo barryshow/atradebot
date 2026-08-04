@@ -48,7 +48,6 @@ export function SymbolCard({ snapshot }: { snapshot: Partial<SymbolSnapshot> }) 
   const short = symbolIcons[sym] || sym.slice(0, 3);
   const dir = snapshot.direction;
   const prob = snapshot.mlProb;
-  const gates = snapshot.riskGates || [];
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-3">
@@ -64,11 +63,22 @@ export function SymbolCard({ snapshot }: { snapshot: Partial<SymbolSnapshot> }) 
               {dir}
             </span>
           )}
+          {/* Regime badge */}
+          {snapshot.regime && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+              snapshot.regime === "TREND_UP" ? "bg-green-900/50 text-green-400" :
+              snapshot.regime === "TREND_DOWN" ? "bg-red-900/50 text-red-400" :
+              snapshot.regime === "HIGH_VOLATILITY" ? "bg-purple-900/50 text-purple-400" :
+              "bg-gray-800 text-gray-400"
+            }`}>
+              {snapshot.regime.replace(/_/g, " ")}
+            </span>
+          )}
         </div>
         {typeof prob === "number" && (
           <div className="text-right">
-            <div className="text-xs text-gray-400">ML胜率</div>
-            <div className={`text-lg font-bold ${prob >= 0.556 ? "text-green-400" : "text-gray-500"}`}>
+            <div className="text-xs text-gray-400">ML概率</div>
+            <div className={`text-lg font-bold ${prob >= 0.55 ? "text-green-400" : "text-gray-500"}`}>
               {(prob * 100).toFixed(1)}%
             </div>
           </div>
@@ -95,23 +105,6 @@ export function SymbolCard({ snapshot }: { snapshot: Partial<SymbolSnapshot> }) 
           )}
         </div>
       </div>
-
-      {/* Risk gate indicators */}
-      {gates.length > 0 && (
-        <div className="flex gap-1.5 flex-wrap">
-          {gates.map((g, i) => (
-            <span
-              key={i}
-              className={`text-[10px] px-1.5 py-0.5 rounded ${
-                g.passed ? "bg-green-900/50 text-green-400" : "bg-red-900/50 text-red-400"
-              }`}
-              title={g.reason}
-            >
-              L{g.level} {g.name}
-            </span>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

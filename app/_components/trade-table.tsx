@@ -24,8 +24,7 @@ export function TradeTable({ trades }: { trades: TradeRecord[] }) {
             <th className="py-2 px-2 font-medium">方向</th>
             <th className="py-2 px-2 font-medium">入场价</th>
             <th className="py-2 px-2 font-medium">投入</th>
-            <th className="py-2 px-2 font-medium">ML胜率</th>
-            <th className="py-2 px-2 font-medium">AI理由</th>
+            <th className="py-2 px-2 font-medium">概率</th>
             <th className="py-2 px-2 font-medium">结果</th>
             <th className="py-2 px-2 font-medium">盈亏</th>
           </tr>
@@ -51,10 +50,9 @@ export function TradeTable({ trades }: { trades: TradeRecord[] }) {
                 <td className="py-2 px-2 font-mono">${t.entryPrice.toFixed(2)}</td>
                 <td className="py-2 px-2">{t.amount}U</td>
                 <td className="py-2 px-2 font-mono">{(t.mlProb * 100).toFixed(1)}%</td>
-                <td className="py-2 px-2 text-xs text-gray-400 max-w-[120px] truncate">{t.aiReason}</td>
                 <td className="py-2 px-2">
-                  {t.result === "win" && <span className="text-green-400">✅</span>}
-                  {t.result === "loss" && <span className="text-red-400">❌</span>}
+                  {t.result === "win" && <span className="text-green-400">✅ WIN</span>}
+                  {t.result === "loss" && <span className="text-red-400">❌ LOSS</span>}
                   {t.result === "pending" && <span className="text-yellow-400 animate-pulse">⏳</span>}
                 </td>
                 <td className="py-2 px-2 font-mono">

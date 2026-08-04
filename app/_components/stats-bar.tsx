@@ -14,26 +14,31 @@ export function StatsBar({ status }: { status: EngineStatus }) {
   const total = status.wins + status.losses;
   const wr = total > 0 ? ((status.wins / total) * 100).toFixed(1) + "%" : "--";
   const profit = status.profit ?? 0;
+  const betMode = status.betMode ?? "ev_based";
+  const risk = status.risk;
+  const consecutiveLosses = risk?.consecutive_losses ?? 0;
 
   return (
-    <div className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-lg px-6 py-3">
+    <div className="flex items-center justify-between bg-gray-900 border border-gray-800 rounded-lg px-6 py-3 flex-wrap gap-2">
       <Stat label="余额" value={`${(status.balance ?? 0).toFixed(2)}U`} />
-      <div className="w-px h-8 bg-gray-800" />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
       <Stat
         label="累计盈亏"
         value={`${profit >= 0 ? "+" : ""}${profit.toFixed(2)}U`}
         color={profit >= 0 ? "text-green-400" : "text-red-400"}
       />
-      <div className="w-px h-8 bg-gray-800" />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
       <Stat label="总战绩" value={`${status.wins}胜 ${status.losses}负`} />
-      <div className="w-px h-8 bg-gray-800" />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
       <Stat label="胜率" value={wr} color={total > 0 && status.wins / total >= 0.5 ? "text-green-400" : "text-red-400"} />
-      <div className="w-px h-8 bg-gray-800" />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
       <Stat label="持仓" value={`${status.activeTrades}/${status.maxConcurrentTrades}`} />
-      <div className="w-px h-8 bg-gray-800" />
-      <Stat label="模式" value="凯利滚仓" color="text-yellow-400" />
-      <div className="w-px h-8 bg-gray-800" />
-      <Stat label="运行时间" value={formatUptime(status.uptime)} />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
+      <Stat label="模式" value={betMode === "ev_based" ? "EV决策" : betMode} color="text-cyan-400" />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
+      <Stat label="连亏" value={`${consecutiveLosses}`} color={consecutiveLosses >= 3 ? "text-red-400" : "text-gray-300"} />
+      <div className="w-px h-8 bg-gray-800 hidden md:block" />
+      <Stat label="运行" value={formatUptime(status.uptime)} />
     </div>
   );
 }

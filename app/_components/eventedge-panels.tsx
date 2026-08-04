@@ -35,6 +35,17 @@ const rejectLabels: Record<RejectReasonCode, string> = {
   SIGNAL_VALIDATION: "信号验证",
   ORDER_FAILED: "下单失败",
   CONFIG_DISABLED: "配置禁用",
+  INSUFFICIENT_EV: "EV不足",
+  PAYOUT_NOT_VERIFIED: "Payout未验证",
+  INVALID_PAYOUT: "无效Payout",
+  WEAK_DIRECTION: "方向弱",
+  SYMBOL_DISABLED: "品种禁用",
+  MAX_CONCURRENT_ORDERS: "同时订单上限",
+  DAILY_MAX_TRADES: "日交易上限",
+  DAILY_LOSS_LIMIT: "日亏损上限",
+  CONSECUTIVE_LOSS_PAUSE: "连续亏损暂停",
+  IDEMPOTENCY_BLOCK: "重复下单拦截",
+  DATA_STALE: "数据过期",
 };
 
 export function RegimeIndicator({ regime, confidence }: { regime?: MarketRegimeType; confidence?: number }) {

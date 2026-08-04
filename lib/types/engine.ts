@@ -1,6 +1,14 @@
 export type EngineState = "stopped" | "starting" | "running" | "paused" | "error";
 
-export type RunMode = "BACKTEST" | "SHADOW" | "LIVE";
+export type RunModeV6 = "PAPER" | "SHADOW" | "LIVE";
+
+export interface LiveGateStatus {
+  passed: boolean;
+  hard_blocks: string[];
+  soft_warnings: string[];
+  reasons: string[];
+  checks: Record<string, boolean>;
+}
 
 export interface EngineStatus {
   state: EngineState;
@@ -15,19 +23,28 @@ export interface EngineStatus {
   lastTick: string | null;
   betMode?: string;
   profit?: number;
-  runMode?: RunMode;
+  runMode?: RunModeV6;
   calibrationReady?: boolean;
   healthTradeCount?: number;
   fastScanCount?: number;
   fastScanInterval?: number;
   fastModelLoaded?: boolean;
-  liveGate?: {
-    passed: boolean;
-    reasons: string[];
-    hard_blocks?: string[];
-    soft_warnings?: string[];
-  };
+  liveGate?: LiveGateStatus;
   symbolModes?: Record<string, string>;
+  risk?: {
+    status: string;
+    paused: boolean;
+    paused_reason: string;
+    pause_remaining_seconds: number;
+    daily_pnl: number;
+    daily_trades: number;
+    daily_max_trades: number;
+    consecutive_losses: number;
+    kelly_enabled: boolean;
+    disabled_symbols: string[];
+  };
+  payout_available?: boolean;
+  settlement_available?: boolean;
 }
 
 export type EngineEventType =
@@ -44,7 +61,6 @@ export type EngineEventType =
   | "balance_update"
   | "candle_update"
   | "pong"
-  // EventEdge V2
   | "regime_update"
   | "expert_votes"
   | "edge_calculation"
@@ -52,6 +68,8 @@ export type EngineEventType =
   | "model_health"
   | "trade_rejected"
   | "shadow_trade"
+  | "shadow_order_created"
+  | "shadow_order_settled"
   | "calibration_status"
   | "decision_cycle"
   | "funnel"
@@ -152,7 +170,19 @@ export type RejectReasonCode =
   | "CONSECUTIVE_LOSS"
   | "SIGNAL_VALIDATION"
   | "ORDER_FAILED"
-  | "CONFIG_DISABLED";
+  | "CONFIG_DISABLED"
+  // v6 additions
+  | "INSUFFICIENT_EV"
+  | "PAYOUT_NOT_VERIFIED"
+  | "INVALID_PAYOUT"
+  | "WEAK_DIRECTION"
+  | "SYMBOL_DISABLED"
+  | "MAX_CONCURRENT_ORDERS"
+  | "DAILY_MAX_TRADES"
+  | "DAILY_LOSS_LIMIT"
+  | "CONSECUTIVE_LOSS_PAUSE"
+  | "IDEMPOTENCY_BLOCK"
+  | "DATA_STALE";
 
 export type SettlementStatus =
   | "PENDING"
