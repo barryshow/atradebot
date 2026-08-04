@@ -1,39 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-ATradeBot 引擎 v5 — EventEdge V2 + Realtime Fast Entry
+ATradeBot Engine v6 — EV-based Decision Engine + Reliable Settlement.
 
-Realtime Feed (Gate.io 1m/5m)
-  → Multi-Timeframe Features
-  → Slow Context (15m LightGBM, every 15m)
-  → Fast Entry (1m LightGBM, every 5s scan)
-  → Ensemble + Edge + Ranker + Risk → Order
+Architecture:
+  RealtimeFeed (Gate.io 1m/5m)
+    ├─ Fast Model (1m LightGBM) → fast_prob
+    ├─ Slow Model (15m LightGBM) → slow_prob
+    ├─ Probability Calibrator → calibrated_prob
+    ├─ Payout Fetcher (HIBT API) → payout_call_net, payout_put_net
+    └─ DecisionEngine.evaluate() → CALL / PUT / ABSTAIN
+         ├─ RiskManager checks
+         ├─ RunModeManager (PAPER/SHADOW/LIVE)
+         └─ TradeLedger (SQLite)
 
-每笔交易仍是 15 分钟 HIBT Event Contract 到期。
+Key changes from v5:
+  - No more "prob >= 0.50 → CALL" — uses EV formula
+  - No more balance-based settlement guessing
+  - Default SHADOW mode, LIVE requires explicit opt-in
+  - BTC disabled until OOS validation passes
 """
 import time, json, sys, os, joblib, numpy as np, pandas as pd
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, Dict, List
+
 from . import config
 from .exchange import fetch_balance, place_order
 from .notifier import notify_trade, notify_result
-from .models import (Prediction, TradeSignal, GateResult, EdgeResult,
-                     MarketRegime, EnsemblePrediction, ExpertPrediction)
-from .order_executor import OrderExecutor
-from .regime_detector import MarketRegimeDetector, get_regime_detector
-from .experts import ExpertManager, get_expert_manager
-from .edge_engine import EdgeEngine, get_edge_engine
-from .uncertainty import ModelUncertaintyEstimator, get_uncertainty_estimator
-from .portfolio_risk import PortfolioRiskManager, get_portfolio_risk
-from .opportunity_ranker import OpportunityRanker, get_opportunity_ranker
-from .shadow_mode import (ShadowMode, RunMode, get_shadow_mode, set_run_mode,
-                          CalibrationStatus, SettlementSource, ShadowCandidateRecord)
-from .trade_ledger import TradeLedger, TradeRecord, get_trade_ledger
-from .settlement_ledger import SettlementLedger, get_settlement_ledger, RejectReason
-from .model_health import ModelHealthMonitor, get_model_health_monitor
-from .probability_calibrator import WalkForwardCalibrator
-from .realtime_feed import RealtimeFeed, get_realtime_feed
+from .realtime_feed import RealtimeFeed, RealtimePrice, get_realtime_feed
 from .multi_timeframe_features import (
     compute_fast_entry_features, FAST_FEATURES, build_fast_feature_vector)
+
+# New modules
+from .run_mode import (
+    RunMode, RunModeManager, LiveGate, get_run_mode_manager, is_killed)
+from .strategy.decision_engine import DecisionEngine, Decision, DecisionType
+from .risk.risk_manager import RiskManager, RiskCheckResult, get_risk_manager
+from .data.trade_ledger import TradeLedger, TradeRecord, get_trade_ledger
+from .settlement.reconciler import (
+    SettlementReconciler, SettlementEvent, get_settlement_reconciler)
+from .models.model_registry import ModelRegistry, get_model_registry
+from .probability_calibrator import WalkForwardCalibrator
+from .regime_detector import MarketRegimeDetector, get_regime_detector
+from .experts import ExpertManager, get_expert_manager
 
 
 def emit(event_type: str, payload: dict):
@@ -41,7 +48,6 @@ def emit(event_type: str, payload: dict):
     line = json.dumps(event, ensure_ascii=False) + "\n"
     sys.stdout.write(line)
     sys.stdout.flush()
-    # Debug: also write to file for diagnostics
     try:
         _debug_fd = getattr(emit, "_fd", None)
         if _debug_fd is None:
@@ -53,189 +59,137 @@ def emit(event_type: str, payload: dict):
         pass
 
 
-def _fuse_probabilities(fast_prob: float, slow_prob: float, features: dict) -> float:
-    """融合 Fast 和 Slow 概率。
-    当 Slow 模型无强意见（概率接近0.50）时，更信任 Fast；
-    当两者一致时，等权；当冲突时，偏向 Fast。"""
-    slow_confidence = abs(slow_prob - 0.50)  # Slow 模型偏离0.50的程度
-    if slow_confidence < 0.02:
-        # Slow 模型无意见 → Fast 权重 0.85
-        w_fast = 0.85
-    elif abs(fast_prob - slow_prob) > 0.10:
-        # 冲突 → Fast 权重 0.70
-        w_fast = 0.70
-    else:
-        # 一致 → 等权
-        w_fast = 0.50
-    return w_fast * fast_prob + (1 - w_fast) * slow_prob
-
-
-@dataclass
-class CandidateOpportunity:
-    symbol: str = ""
-    direction_str: str = ""
-    direction_int: int = 0
-    current_price: float = 0.0
-    current_bar_ts: object = None
-    current_ts: int = 0
-    regime: Optional[MarketRegime] = None
-    ensemble: Optional[EnsemblePrediction] = None
-    predictions: list = field(default_factory=list)
-    edge: Optional[EdgeResult] = None
-    indicators: dict = field(default_factory=dict)
-    row: dict = field(default_factory=dict)
-    position: Optional[object] = None
-
-
 class TradingEngine:
-    def __init__(self, run_mode: str = "live", smoke_test: bool = False):
-        self.executor = OrderExecutor()
-        self.reset_state()
+    def __init__(self, run_mode: str = "shadow", smoke_test: bool = False):
+        # ── New core modules ──
+        self.run_mode_mgr = get_run_mode_manager()
+        self.decision_engine = DecisionEngine()
+        self.risk_manager = get_risk_manager()
+        self.trade_ledger = get_trade_ledger()
+        self.reconciler = get_settlement_reconciler()
+        self.model_registry = get_model_registry()
+
+        # ── Legacy modules (kept for model inference) ──
         self.regime_detector = get_regime_detector()
         self.expert_manager = get_expert_manager()
-        self.edge_engine = get_edge_engine()
-        self.uncertainty = get_uncertainty_estimator()
-        self.portfolio_risk = get_portfolio_risk()
-        self.ranker = get_opportunity_ranker()
-        self.trade_ledger = get_trade_ledger()
-        self.settlement_ledger = get_settlement_ledger()
-        self.model_health = get_model_health_monitor()
         self.calibrator = WalkForwardCalibrator(method="isotonic", min_samples=50)
-        mode = RunMode.LIVE if run_mode == "live" else (RunMode.SHADOW if run_mode == "shadow" else RunMode.BACKTEST)
-        self.shadow = ShadowMode(mode=mode)
-        self._smoke_test = smoke_test
-        self._smoke_order_count = 0
-        self._smoke_max_orders = 1
-        self._realtime_feed: Optional[RealtimeFeed] = None
+
+        # ── State ──
+        self.running = False
+        self.paused = False
+        self.balance = 0.0
+        self.start_balance = 0.0
+        self.total_pnl = 0.0
+        self.active_hibt_order_ids: List[str] = []
+        self.last_data_update: Dict[str, float] = {}
+        self._cooldown_seconds = config.SIGNAL_COOLDOWN_SECONDS
+        self._last_trade_time: Dict[str, float] = {}
+        self._hourly_trade_count: Dict[str, int] = {}
+        self._hourly_window_start = time.time()
+        self._consecutive_same_symbol: Dict[str, int] = {}
+
+        # ── Models ──
         self._fast_models: Dict[str, object] = {}
         self._fast_scalers: Dict[str, object] = {}
         self._fast_model_loaded = False
         self._slow_context: Dict[str, dict] = {}
         self._last_slow_update: Dict[str, float] = {}
+
+        # ── Timing ──
         self._last_fast_scan = 0.0
         self._fast_scan_count = 0
-        self._hourly_trade_count: Dict[str, int] = {}
-        self._hourly_trade_window_start = time.time()
-        self._last_trade_time: Dict[str, float] = {}
-        self._warmup_until: float = 0.0  # 启动后 warmup，期间不下单
-        self._warmup_seconds = 180       # 默认3分钟
-        self._cooldown_seconds = config.SIGNAL_COOLDOWN_SECONDS
-        self._health_trades: list = []
-        self._last_health_check = time.time()
-        self._sys_funnel: dict[str, int] = {}
-        self._strat_funnel: dict[str, dict[str, int]] = {}
+        self._warmup_until = time.time() + 180  # 3 min warmup
         self._funnel_last_report = time.time()
-        self._last_decision_bar: dict[str, object] = {}
-        self._bars_evaluated_total: dict[str, int] = {}
-        self._consecutive_same_symbol: dict[str, int] = {}  # 同币种连续交易计数
-        self._last_trade_balance_snapshots: list = []      # 结算前余额快照，用于PnL校验
+        self._strat_funnel: Dict[str, Dict[str, int]] = {}
+        self._realtime_feed: Optional[RealtimeFeed] = None
 
-    def set_run_mode(self, mode: str):
-        m = RunMode.LIVE if mode == "live" else (RunMode.SHADOW if mode == "shadow" else RunMode.BACKTEST)
-        self.shadow = ShadowMode(mode=m)
+        # ── Smoke test ──
+        self._smoke_test = smoke_test
+        self._smoke_order_count = 0
+        self._smoke_max_orders = 1
 
-    def reset_state(self):
-        self.running = False; self.paused = False
-        self.balance = 0.0; self.start_balance = 0.0
-        self.active_trades: list[dict] = []
-        self.last_trade_ts: dict[str, int] = {s: 0 for s in config.SYMBOLS}
-        self.last_reject_ts: dict[str, int] = {s: 0 for s in config.SYMBOLS}
-        self.last_signal_bar_ts: dict[str, object] = {s: None for s in config.SYMBOLS}
-        self.recent_results: list[bool] = []
-        self.consecutive_losses = 0; self.halted = False; self.pause_until = 0
-        self.total_pnl = 0.0; self.total_wins = 0; self.total_losses = 0
-        self._warmup_done: dict[str, bool] = {s: False for s in config.SYMBOLS}
-        self._shadow_simulated_balance = False
-        self.executor = OrderExecutor()
+    # ═══════════════════════════════════════════════════════════
+    # Start / Stop
+    # ═══════════════════════════════════════════════════════════
 
-    # ── Funnel helpers ──
-    def _sys_funnel_count(self, stage: str):
-        self._sys_funnel[stage] = self._sys_funnel.get(stage, 0) + 1
-
-    def _strat_funnel_count(self, symbol: str, stage: str):
-        if symbol not in self._strat_funnel:
-            self._strat_funnel[symbol] = {}
-        self._strat_funnel[symbol][stage] = self._strat_funnel[symbol].get(stage, 0) + 1
-
-    def _emit_funnel_report(self):
-        now = time.time()
-        if now - self._funnel_last_report < 60:
-            return
-        self._funnel_last_report = now
-        emit("funnel", {"type": "system",
-            "ticks_total": self._sys_funnel.get("ticks_total", 0),
-            "fast_scans": self._fast_scan_count,
-            "data_stale": self._sys_funnel.get("data_stale", 0)})
-        for sym in sorted(self._strat_funnel.keys()):
-            f = self._strat_funnel[sym]
-            emit("funnel", {"type": "strategy", "symbol": sym,
-                "edge_rejected": f.get("edge_rejected", 0),
-                "edge_passed": f.get("edge_passed", 0),
-                "weak_direction_rejected": f.get("weak_direction_rejected", 0),
-                "chop_rejected": f.get("chop_rejected", 0),
-                "concentration_rejected": f.get("concentration_rejected", 0),
-                "cooldown_rejected": f.get("cooldown_rejected", 0),
-                "symbol_max_rejected": f.get("symbol_max_rejected", 0),
-                "max_active_rejected": f.get("max_active_rejected", 0),
-                "max_hourly_rejected": f.get("max_hourly_rejected", 0),
-                "candidate_generated": f.get("candidate_generated", 0),
-                "shadow_trade": f.get("shadow_trade", 0),
-                "observe_only": f.get("observe_only", 0)})
-
-    # ── Start / Stop ──
     def start(self):
-        self.reset_state()
         self.running = True
-        self._warmup_until = time.time() + self._warmup_seconds  # 启动 warmup
-        run_mode = self.shadow.get_mode()
+        self._warmup_until = time.time() + 180
 
-        shadow_symbols = list(self.shadow.get_symbol_mode_summary().keys())
-        self._realtime_feed = RealtimeFeed(shadow_symbols, scan_interval=config.FAST_SCAN_INTERVAL_SECONDS)
+        symbols = list(config.SHADOW_SYMBOL_MODE.keys())
+        self._realtime_feed = RealtimeFeed(symbols, scan_interval=config.FAST_SCAN_INTERVAL_SECONDS)
         self._realtime_feed.start()
         self._load_fast_models()
+        self._register_models()
 
-        # ── 从 ledger 加载历史交易数（渐进式凯利置信度种子） ──
-        self._seed_progressive_kelly_from_ledger()
+        # ── Seed from ledger ──
+        settled = self.trade_ledger.get_settled_count()
+        if settled["total"] > 0:
+            emit("log", {"msg": f"Ledger: {settled['total']} settled trades loaded (W{settled['wins']}/L{settled['losses']})"})
 
-        # ── 先查余额 ──
+        # ── Balance ──
         self.balance = fetch_balance()
-        if self.balance < 0: self.balance = 0.0
-        if run_mode == "SHADOW" and self.balance < config.MIN_ORDER_USD:
+        if self.balance < 0:
+            self.balance = 0.0
+        run_mode = self.run_mode_mgr.mode
+        if run_mode == RunMode.SHADOW and self.balance < config.MIN_ORDER_USD:
             self.balance = max(500.0, config.MIN_ORDER_USD * 10)
-            self._shadow_simulated_balance = True
-        else:
-            self._shadow_simulated_balance = False
+
         self.start_balance = self.balance
 
-        cal_ready = self.calibrator.is_ready()
-        cal_status = "READY" if cal_ready else "NOT_READY"
-        if not cal_ready:
-            emit("calibration_status", {"status": "NOT_READY", "msg": "PASSTHROUGH_UNCALIBRATED"})
+        # ── Payout + Settlement checks ──
+        payout_call, payout_put = self.reconciler.get_available_payout("BTCUSDT")
+        payout_available = payout_call is not None and payout_put is not None
+        settlement_available = self.reconciler.can_settle_via_hibt()
 
-        live_gate = self.shadow.get_live_gate_status(cal_ready, data_fresh=True,
-            balance_ok=(self.balance >= config.MIN_ORDER_USD))
-        # 移除自动降级 — 让用户在 LIVE 模式下继续运行，只是不下单
-        if run_mode == "LIVE" and not live_gate["passed"]:
-            emit("log", {"msg": f"LIVE 注意: {'; '.join(live_gate['reasons'])}"})
+        # ── LIVE Gate ──
+        calibrator_ready = self.calibrator.is_ready()
+        live_result = self.run_mode_mgr.get_live_gate().check(
+            calibrator_ready=calibrator_ready,
+            data_fresh=True,
+            model_valid=self._fast_model_loaded,
+            has_pending_orders=len(self.trade_ledger.get_pending_settlements()) > 0,
+            risk_paused=False,
+            settlement_available=settlement_available,
+            payout_available=payout_available,
+        )
 
-        sym_modes = self.shadow.get_symbol_mode_summary()
-        active = [s for s, m in sym_modes.items() if m == "SHADOW_ACTIVE"]
+        sym_modes = {s: self.run_mode_mgr.get_symbol_mode(s) for s in symbols}
+        active_symbols = [s for s, m in sym_modes.items() if m == "SHADOW_ACTIVE"]
 
-        emit("status", {"state": "running", "run_mode": run_mode,
-            "calibration": cal_status, "live_gate": live_gate, "symbol_modes": sym_modes,
+        emit("status", {
+            "state": "running",
+            "run_mode": run_mode.value,
+            "calibration": "READY" if calibrator_ready else "NOT_READY",
+            "live_gate": {
+                "passed": live_result.passed,
+                "hard_blocks": live_result.hard_blocks,
+                "soft_warnings": live_result.soft_warnings,
+                "reasons": live_result.reasons,
+                "checks": live_result.all_checks,
+            },
+            "payout_available": payout_available,
+            "settlement_available": settlement_available,
+            "symbol_modes": sym_modes,
             "fast_scan_interval": config.FAST_SCAN_INTERVAL_SECONDS,
-            "fast_model_loaded": self._fast_model_loaded})
+            "fast_model_loaded": self._fast_model_loaded,
+        })
 
-        emit("log", {"msg": f"EventEdge V2 Fast Entry | 余额{self.balance:.0f}U | "
-            f"扫描{config.FAST_SCAN_INTERVAL_SECONDS}s | Cooldown{self._cooldown_seconds}s | "
-            f"MaxTrades/h{config.MAX_NEW_TRADES_PER_HOUR} | "
-            f"Active:{','.join(active) if active else 'none'} | "
-            f"FastModel:{'OK' if self._fast_model_loaded else 'NONE'} | "
-            f"LIVE:{'ENABLED' if live_gate['passed'] else 'DISABLED'}"})
+        emit("log", {"msg": (
+            f"Engine v6 EV-Based | RunMode={run_mode.value} | "
+            f"Balance={self.balance:.0f}U | Scan={config.FAST_SCAN_INTERVAL_SECONDS}s | "
+            f"Active={','.join(active_symbols) if active_symbols else 'none'} | "
+            f"Calibrator={'OK' if calibrator_ready else 'NOT_READY'} | "
+            f"Payout={'API' if payout_available else 'HARDCODED'} | "
+            f"Settlement={'HIBT' if settlement_available else 'UNAVAILABLE'} | "
+            f"LIVE={'OK' if live_result.passed else 'BLOCKED: '+','.join(live_result.hard_blocks[:3])}"
+        )})
 
     def stop(self):
-        self.running = False; self.paused = False
-        if self._realtime_feed: self._realtime_feed.stop()
+        self.running = False
+        self.paused = False
+        if self._realtime_feed:
+            self._realtime_feed.stop()
         emit("status", {"state": "stopped"})
 
     def pause(self):
@@ -243,28 +197,28 @@ class TradingEngine:
         emit("status", {"state": "paused"})
 
     def resume(self):
-        self.paused = False; self.halted = False
-        self.pause_until = 0; self.consecutive_losses = 0
+        self.paused = False
+        self.risk_manager.reset_pause()
         emit("status", {"state": "running"})
 
-    def _seed_progressive_kelly_from_ledger(self):
-        """从 ledger 加载已结算交易数作为渐进凯利的置信度种子"""
-        try:
-            settled = self.trade_ledger.get_settled_count()
-            if settled > 0:
-                self.total_wins = settled.get("wins", 0)
-                self.total_losses = settled.get("losses", 0)
-                total = self.total_wins + self.total_losses
-                confidence = min(1.0, total / config.KELLY_FULL_CONFIDENCE_TRADES)
-                confidence_pct = round(confidence * 100, 1)
-                emit("log", {"msg": f"渐进凯利: 从ledger加载{total}笔历史 (W{self.total_wins}/L{self.total_losses}), "
-                    f"置信度{confidence_pct}%"})
-        except Exception:
-            pass
+    def _register_models(self):
+        """Register loaded models in the registry."""
+        for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
+            fast_path = os.path.join(config.MODEL_DIR, f"{sym.lower()}_fast_entry.pkl")
+            if os.path.exists(fast_path):
+                self.model_registry.register(
+                    model_name=f"{sym.lower()}_fast_entry_v1",
+                    model_type="fast_entry",
+                    symbol=sym,
+                    file_path=fast_path,
+                    feature_count=len(FAST_FEATURES),
+                    is_active=1 if sym != "BTCUSDT" else 0,  # BTC disabled
+                )
 
     def _load_fast_models(self):
         model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models")
-        if not os.path.isdir(model_dir): model_dir = os.path.join(os.getcwd(), "models")
+        if not os.path.isdir(model_dir):
+            model_dir = os.path.join(os.getcwd(), "models")
         loaded = 0
         for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
             path = os.path.join(model_dir, f"{sym.lower()}_fast_entry.pkl")
@@ -274,20 +228,19 @@ class TradingEngine:
                     self._fast_models[sym] = bundle["model"]
                     self._fast_scalers[sym] = bundle["scaler"]
                     loaded += 1
-                except Exception: pass
+                except Exception:
+                    pass
         self._fast_model_loaded = loaded > 0
 
     # ═══════════════════════════════════════════════════════════
-    # Fast Entry Scan (每 5s)
+    # Fast Scan (every 5s)
     # ═══════════════════════════════════════════════════════════
 
     def _run_fast_entry_scan(self):
         now = time.time()
 
-        # 启动 warmup：前 N 秒只收集数据，不下单
         if now < self._warmup_until:
             return
-
         if now - self._last_fast_scan < config.FAST_SCAN_INTERVAL_SECONDS:
             return
         self._last_fast_scan = now
@@ -295,27 +248,50 @@ class TradingEngine:
 
         if self._realtime_feed is None:
             return
-        if now - self._hourly_trade_window_start > 3600:
-            self._hourly_trade_count = {}
-            self._hourly_trade_window_start = now
 
-        candidates = []
+        # Reset hourly counter
+        if now - self._hourly_window_start > 3600:
+            self._hourly_trade_count = {}
+            self._hourly_window_start = now
+
+        # ── Check kill switch ──
+        if is_killed():
+            return
+
+        # ── Check risk manager pause ──
+        risk_status = self.risk_manager.get_status()
+        if risk_status["paused"]:
+            if self._fast_scan_count % 60 == 0:  # Log every 5 min
+                emit("log", {"msg": f"Risk paused: {risk_status['paused_reason']}, remaining={risk_status['pause_remaining_seconds']}s"})
+            return
+
+        decisions: List[Decision] = []
+
         for sym in self._realtime_feed.symbols:
-            sym_mode = self.shadow.get_symbol_mode(sym)
-            if sym_mode.value == "DISABLED":
+            # Skip disabled symbols
+            if not self.run_mode_mgr.is_symbol_active(sym):
+                continue
+            if not self.risk_manager.is_symbol_enabled(sym):
                 continue
 
+            # Get data
             df_1m = self._realtime_feed.get_klines(sym, "1m")
             df_5m = self._realtime_feed.get_klines(sym, "5m")
             rt = self._realtime_feed.get_realtime_price(sym)
             if df_1m is None or len(df_1m) < 50 or rt is None:
                 continue
 
+            self.last_data_update[sym] = now
+
+            # Update slow context
             self._update_slow_context(sym, df_1m)
 
+            # Compute features
             fast_features = compute_fast_entry_features(
-                sym, rt, df_1m, df_5m, slow_context=self._slow_context.get(sym))
+                sym, rt, df_1m, df_5m,
+                slow_context=self._slow_context.get(sym))
 
+            # Fast model prediction
             fast_prob = 0.50
             if self._fast_model_loaded and sym in self._fast_models:
                 try:
@@ -327,167 +303,367 @@ class TradingEngine:
                 except Exception:
                     fast_prob = 0.50
 
+            # Slow model probability
             slow_ctx = self._slow_context.get(sym, {})
             slow_prob = slow_ctx.get("probability", 0.50)
-            ensemble_prob = _fuse_probabilities(fast_prob, slow_prob, fast_features)
 
-            direction = 1 if ensemble_prob >= 0.50 else 2
-            direction_str = "CALL" if direction == 1 else "PUT"
-            if direction == 2:
-                ensemble_prob = max(0.35, 1.0 - ensemble_prob)
+            # Calibrate
+            calibrated_prob = self._calibrate_probability(fast_prob)
 
-            # 方向概率：fast_prob 是 P(CALL)，edge 需要 P(选定方向)
-            edge_prob = fast_prob if direction == 1 else (1.0 - fast_prob)
-            edge = self.edge_engine.compute(
-                symbol=sym, calibrated_probability=edge_prob,  # 用选定方向的概率
-                direction=direction_str, direction_int=direction,
-                expiry_minutes=config.HOLD_MINUTES, entry_price=rt.price,
-                uncertainty_margin=0.015, calibration_margin=0.005, regime=slow_ctx.get("regime", "RANGE"))
-            # 注入历史交易数（渐进式凯利用）
-            edge.total_trades = self.total_wins + self.total_losses
+            # ── Get payout (try API first, fall back to hardcoded) ──
+            payout_call_net, payout_put_net = self.reconciler.get_available_payout(sym)
+            payout_source = "api"
+            if payout_call_net is None or payout_put_net is None:
+                payout_source = "hardcoded"
+                payout_call_net = config.PAYOUT_RATES.get(sym, 0.80)
+                payout_put_net = config.PAYOUT_RATES.get(sym, 0.80)
 
-            cooldown_key = f"{sym}_{direction_str}"
-            in_cooldown = (now - self._last_trade_time.get(cooldown_key, 0)) < self._cooldown_seconds
-            # 每品种独立限制: 最多 1 个活跃合约
-            active_for_symbol = sum(1 for t in self.active_trades if t.get("symbol") == sym)
-            max_per_symbol = 1
-            # 全局上限
-            total_active = len(self.active_trades)
-            max_global = config.MAX_ACTIVE_EVENT_CONTRACTS
-            hourly_count = self._hourly_trade_count.get(sym, 0)
-            max_hourly = config.MAX_NEW_TRADES_PER_HOUR
+            # ── EV-based decision ──
+            decision = self.decision_engine.evaluate(
+                symbol=sym,
+                fast_probability=fast_prob,
+                slow_probability=slow_prob,
+                calibrated_probability=calibrated_prob,
+                payout_call_net=payout_call_net,
+                payout_put_net=payout_put_net,
+                payout_source=payout_source,
+                regime=slow_ctx.get("regime", "RANGE"),
+                model_version="fast_entry_v1",
+                feature_version="v1",
+                gate_price=rt.price,
+                signal_time_ms=int(now * 1000),
+            )
 
-            # ── 窄幅震荡行情自动降频 ──
-            # 当 ATR% < 0.3%，ADX < 18 或 NATR < 0.008 → 区间震荡，不提方向信号
-            status = ""  # 初始化为空，后续条件限定后覆盖
+            # ── Emit scan result ──
+            emit("fast_scan", {
+                "symbol": sym,
+                "direction": decision.decision.value,
+                "fast_prob": round(fast_prob, 4),
+                "slow_prob": round(slow_prob, 4),
+                "calibrated_prob": round(calibrated_prob, 4),
+                "ev_call": round(decision.ev_call, 6),
+                "ev_put": round(decision.ev_put, 6),
+                "selected_ev": round(decision.selected_ev, 6),
+                "payout_source": payout_source,
+                "status": "PASSED" if decision.passed else decision.reject_reason,
+                "active_contracts": len(self.active_hibt_order_ids),
+            })
 
-            # ── 信号方向强度检查（优先于所有其他判定） ──
-            # 概率必须在 0.50±阈值 之外，防止 0.501/0.499 的伪信号开单
-            direction_strength = abs(ensemble_prob - 0.50)
-            if direction_strength < config.MIN_DIRECTION_STRENGTH:
-                status = "WEAK_DIRECTION"
-            adx_val = float(fast_features.get("ADX", 20))
-            atr_pct = float(fast_features.get("ATR_pct", 1.0))
-            natr_val = float(fast_features.get("NATR", 0.01))
-            in_chop = (adx_val < 18) or (atr_pct < 0.003) or (natr_val < 0.008)
-            chop_min_prob = 0.65  # 震荡中要求更高概率门槛
-            in_chop_low_prob = in_chop and edge_prob < chop_min_prob
-            if in_chop_low_prob:
-                status = "CHOP_LOW_PROB"
+            # ── Record abstentions ──
+            if not decision.passed:
+                self._strat_funnel_count(sym, f"reject_{decision.reject_reason.lower()}")
+                self.trade_ledger.mark_abstain(
+                    trade_id="", symbol=sym, direction=decision.decision.value,
+                    reject_reason=decision.reject_reason,
+                    signal_time_ms=int(now * 1000), gate_price=rt.price,
+                    fast_prob=fast_prob, slow_prob=slow_prob, calibrated=calibrated_prob,
+                    ev_call=decision.ev_call, ev_put=decision.ev_put,
+                    run_mode=self.run_mode_mgr.mode.value,
+                )
+                continue
 
-            # ── 单币种集中度限制 ──
-            # 同一币种连续 3 笔后强制冷却，防止区间震荡中连环亏损
+            # ── Risk checks ──
+            risk_check = self.risk_manager.check_all(
+                active_order_count=len(self.active_hibt_order_ids),
+                data_last_update=self.last_data_update.get(sym, 0),
+                symbol=sym,
+            )
+            if not risk_check.allowed:
+                decision.passed = False
+                decision.reject_reason = risk_check.reason
+                self._strat_funnel_count(sym, f"risk_{risk_check.reason.lower()}")
+                continue
+
+            # ── Cooldown ──
+            key = f"{sym}_{decision.decision.value}"
+            if key in self._last_trade_time:
+                elapsed = now - self._last_trade_time[key]
+                if elapsed < self._cooldown_seconds:
+                    self._strat_funnel_count(sym, "cooldown_rejected")
+                    continue
+
+            # ── Concentration check ──
             same_sym_count = self._consecutive_same_symbol.get(sym, 0)
             if same_sym_count >= 3:
-                status = "SYMBOL_CONCENTRATION"
+                self._strat_funnel_count(sym, "concentration_rejected")
+                continue
 
-            # Combine all status determination BEFORE emit
-            if not status:  # only set edge status if nothing higher-priority triggered
-                status = "EDGE_PASSED" if edge.passed else "NO_EDGE"
-            if in_cooldown: status = "COOLDOWN"
-            if active_for_symbol >= max_per_symbol: status = "SYMBOL_AT_MAX"
-            if total_active >= max_global: status = "MAX_ACTIVE_TRADES"
-            if hourly_count >= max_hourly: status = "MAX_HOURLY_TRADES"
+            # ── Hourly limit ──
+            hourly = self._hourly_trade_count.get(sym, 0)
+            if hourly >= config.MAX_NEW_TRADES_PER_HOUR:
+                self._strat_funnel_count(sym, "max_hourly_rejected")
+                continue
 
-            # 同品种反方向持仓检查
-            has_opposite = any(
-                t.get("symbol") == sym and t.get("dir") != direction
-                for t in self.active_trades
+            self._strat_funnel_count(sym, "decision_passed")
+            decisions.append(decision)
+
+        # ── Execute best decision ──
+        if decisions:
+            # Select highest EV decision
+            best = max(decisions, key=lambda d: d.selected_ev)
+            self._execute_decision(best)
+
+        # ── Funnel report ──
+        self._emit_funnel_report()
+
+    def _calibrate_probability(self, raw_prob: float) -> float:
+        """Calibrate raw model probability."""
+        if self.calibrator.is_ready():
+            cal = self.calibrator._calibrate_single(raw_prob)
+            return cal
+        return raw_prob
+
+    # ═══════════════════════════════════════════════════════════
+    # Execution
+    # ═══════════════════════════════════════════════════════════
+
+    def _execute_decision(self, decision: Decision):
+        """Execute a trade decision."""
+        now = int(time.time() * 1000)
+        run_mode = self.run_mode_mgr.mode
+
+        # ── Compute stake ──
+        stake, bet_fraction = self.risk_manager.compute_stake(self.balance)
+        stake = max(config.MIN_ORDER_USD, min(stake, self.balance * 0.05))
+
+        # ── Create trade record ──
+        rec = self.trade_ledger.create_record(
+            symbol=decision.symbol,
+            direction=decision.decision.value,
+            direction_int=decision.direction_int,
+            signal_time_ms=decision.signal_time_ms,
+            gate_price_at_signal=decision.gate_price,
+            fast_probability=decision.fast_probability,
+            slow_probability=decision.slow_probability,
+            calibrated_probability=decision.calibrated_probability,
+            payout_call=decision.payout_call_net,
+            payout_put=decision.payout_put_net,
+            expected_value=decision.selected_ev,
+            ev_call=decision.ev_call,
+            ev_put=decision.ev_put,
+            stake=stake,
+            bet_fraction=bet_fraction,
+            model_version=decision.model_version,
+            feature_version=decision.feature_version,
+            run_mode=run_mode.value,
+            reject_reason=decision.reject_reason,
+        )
+
+        # ── SHADOW mode: record only, no real order ──
+        if run_mode != RunMode.LIVE:
+            emit("shadow_order_created", {
+                "symbol": decision.symbol,
+                "direction": decision.decision.value,
+                "trade_id": rec.trade_id,
+                "entry_price": decision.gate_price,
+                "amount": stake,
+                "ev": round(decision.selected_ev, 6),
+                "ev_call": round(decision.ev_call, 6),
+                "ev_put": round(decision.ev_put, 6),
+                "lifecycle": "SHADOW_RECORDED",
+            })
+            self._strat_funnel_count(decision.symbol, "shadow_trade")
+            self._after_trade(decision.symbol, decision.decision.value)
+            return
+
+        # ── LIVE mode: submit real order ──
+        # Idempotency check
+        idemp_key = f"{decision.symbol}_{decision.decision.value}_{int(time.time()/60)}"
+        id_check = self.risk_manager.check_order_idempotency(idemp_key)
+        if not id_check.allowed:
+            self.trade_ledger.mark_rejected(rec.trade_id, id_check.reason, id_check.detail)
+            return
+
+        self.trade_ledger.mark_submitted(rec.trade_id, int(time.time() * 1000))
+
+        result = place_order(
+            decision.symbol,
+            decision.direction_int,
+            stake,
+            config.HOLD_MINUTES,
+        )
+
+        if result.ok and result.order_id:
+            self.risk_manager.record_order_idempotency(idemp_key)
+            self.risk_manager.record_trade()
+            self.trade_ledger.mark_accepted(
+                rec.trade_id,
+                hibt_order_id=result.order_id,
+                accepted_time_ms=int(time.time() * 1000),
+                hibt_open_price=result.open_price or decision.gate_price,
             )
-            if has_opposite and not config.ALLOW_OPPOSITE_OVERLAP:
-                status = "OPPOSITE_OVERLAP"
+            self.active_hibt_order_ids.append(result.order_id)
+            self.balance = fetch_balance()
+            if self.balance < 0:
+                self.balance -= stake
 
-            emit("fast_scan", {"symbol": sym, "direction": direction_str,
-                "fast_prob": round(fast_prob, 4), "slow_prob": round(slow_prob, 4),
-                "ensemble_prob": round(ensemble_prob, 4),
-                "effective_edge": round(edge.effective_edge, 4),
-                "break_even": round(edge.break_even_probability, 4),
-                "status": status, "cooldown": in_cooldown,
-                "active_contracts": total_active,
-                "symbol_active": active_for_symbol,
-                "hourly_trades": hourly_count,
-                "payout_verified": edge.payout_verified,
-                "payout_flag": edge.payout_flag,
-                "edge_flag": edge.edge_flag})
+            emit("trade_executed", {
+                "symbol": decision.symbol,
+                "direction": decision.decision.value,
+                "trade_id": rec.trade_id,
+                "hibt_order_id": result.order_id,
+                "entry_price": decision.gate_price,
+                "amount": stake,
+                "ev": round(decision.selected_ev, 6),
+                "ev_call": round(decision.ev_call, 6),
+                "ev_put": round(decision.ev_put, 6),
+                "balance": self.balance,
+                "lifecycle": "ORDER_ACCEPTED",
+                "payout_verified": result.payout_ratio is not None,
+                "hibt_open_price": result.open_price,
+            })
+            self._after_trade(decision.symbol, decision.decision.value)
+        else:
+            self.trade_ledger.mark_rejected(rec.trade_id, "ORDER_FAILED", result.msg or "unknown")
+            emit("trade_rejected", {
+                "symbol": decision.symbol,
+                "reason": "ORDER_FAILED",
+                "detail": result.msg,
+            })
 
-            if not edge.passed:
-                self._strat_funnel_count(sym, "edge_rejected"); continue
-            if status == "WEAK_DIRECTION":
-                self._strat_funnel_count(sym, "weak_direction_rejected"); continue
-            if in_chop_low_prob:
-                self._strat_funnel_count(sym, "chop_rejected"); continue
-            if same_sym_count >= 3:
-                self._strat_funnel_count(sym, "concentration_rejected"); continue
-            if in_cooldown:
-                self._strat_funnel_count(sym, "cooldown_rejected"); continue
-            if active_for_symbol >= max_per_symbol:
-                self._strat_funnel_count(sym, "symbol_max_rejected"); continue
-            if has_opposite and not config.ALLOW_OPPOSITE_OVERLAP:
-                self._strat_funnel_count(sym, "opposite_rejected"); continue
-            if total_active >= max_global:
-                self._strat_funnel_count(sym, "max_active_rejected"); continue
-            if hourly_count >= max_hourly:
-                self._strat_funnel_count(sym, "max_hourly_rejected"); continue
+    def _after_trade(self, symbol: str, direction: str):
+        """Post-trade bookkeeping."""
+        now = time.time()
+        key = f"{symbol}_{direction}"
+        self._last_trade_time[key] = now
+        self._hourly_trade_count[symbol] = self._hourly_trade_count.get(symbol, 0) + 1
+        self._consecutive_same_symbol[symbol] = self._consecutive_same_symbol.get(symbol, 0) + 1
+        for s in list(self._consecutive_same_symbol.keys()):
+            if s != symbol:
+                self._consecutive_same_symbol[s] = 0
 
-            self._strat_funnel_count(sym, "edge_passed")
+    # ═══════════════════════════════════════════════════════════
+    # Settlement
+    # ═══════════════════════════════════════════════════════════
 
-            ensemble = EnsemblePrediction(symbol=sym, direction=direction,
-                ensemble_probability=round(ensemble_prob, 4),
-                calibrated_probability=round(ensemble_prob, 4),
-                conservative_probability=round(edge.conservative_probability, 4),
-                regime=slow_ctx.get("regime", "RANGE"))
-
-            regime = MarketRegime(regime=slow_ctx.get("regime", "RANGE"), confidence=0.5)
-            candidate = CandidateOpportunity(symbol=sym, direction_str=direction_str,
-                direction_int=direction, current_price=rt.price,
-                current_ts=int(now * 1000), regime=regime,
-                ensemble=ensemble, edge=edge,
-                indicators=fast_features, row=fast_features)
-            candidates.append(candidate)
-            self._strat_funnel_count(sym, "candidate_generated")
-
-        if not candidates:
+    def _check_settlement(self):
+        """Check and reconcile pending orders via HIBT API."""
+        if not self.active_hibt_order_ids:
             return
 
-        tradeable = [c for c in candidates if self.shadow.is_shadow_active(c.symbol) or self.shadow.can_place_order()]
-        edges = [c.edge for c in tradeable if c.edge is not None]
-        if not edges:
-            return
+        # Try HIBT settlement reconciliation
+        events = self.reconciler.reconcile_all_pending(self.active_hibt_order_ids)
 
-        ranked = self.ranker.rank(edges)
-        selected = [o for o in ranked if o.selected]
+        for hibt_id, event in events.items():
+            # Find matching trade record
+            records = self.trade_ledger.query()
+            for rec in records:
+                if rec.hibt_order_id == hibt_id and rec.settlement_status == "PENDING":
+                    self.trade_ledger.mark_settled(
+                        rec.trade_id,
+                        result=event.result,
+                        pnl=event.pnl,
+                        settlement_source="hibt_closed_orders",
+                        hibt_close_price=event.close_price,
+                    )
+                    self.active_hibt_order_ids.remove(hibt_id)
+                    self.balance = fetch_balance()
+                    if self.balance < 0:
+                        self.balance += event.pnl
 
-        for opp in selected:
-            matching = [c for c in tradeable if c.symbol == opp.symbol and c.direction_str == opp.direction]
-            if not matching: continue
-            candidate = matching[0]
-            pos = self.portfolio_risk.compute_position_size(candidate.edge, self.balance)
-            candidate.position = pos
-            self._execute_opportunity(candidate)
-            cooldown_key = f"{opp.symbol}_{opp.direction}"
-            self._last_trade_time[cooldown_key] = now
-            self._hourly_trade_count[opp.symbol] = self._hourly_trade_count.get(opp.symbol, 0) + 1
-            # 同币种连续交易计数（用于集中度限制）
-            self._consecutive_same_symbol[opp.symbol] = self._consecutive_same_symbol.get(opp.symbol, 0) + 1
-            # 其他币种清零（一旦换了币种，集中度重置）
-            for s in list(self._consecutive_same_symbol.keys()):
-                if s != opp.symbol:
-                    self._consecutive_same_symbol[s] = 0
+                    is_win = event.result == "WIN"
+                    self.risk_manager.record_result(is_win)
+                    self.total_pnl += event.pnl
+                    self.calibrator.update(rec.calibrated_probability, 1 if is_win else 0)
+
+                    emit("trade_result", {
+                        "symbol": rec.symbol,
+                        "result": event.result,
+                        "pnl": round(event.pnl, 4),
+                        "trade_id": rec.trade_id,
+                        "hibt_order_id": hibt_id,
+                        "settlement": "HIBT_VERIFIED",
+                        "close_price": event.close_price,
+                        "open_price": event.open_price,
+                    })
+
+                    # Reset concentration counter after settlement
+                    if rec.symbol and self._consecutive_same_symbol.get(rec.symbol, 0) >= 3:
+                        self._consecutive_same_symbol[rec.symbol] = 0
+
+                    emit("balance_update", {"balance": self.balance})
+                    break
+
+        # If HIBT settlement unavailable, use time-based expiry
+        # (only in SHADOW mode — LIVE requires HIBT settlement)
+        if self.run_mode_mgr.mode != RunMode.LIVE:
+            self._settle_shadow_orders()
+
+    def _settle_shadow_orders(self):
+        """Time-based settlement for SHADOW mode (no real orders)."""
+        now = time.time()
+        # Get pending SHADOW records from ledger
+        pending = [r for r in self.trade_ledger.get_pending_settlements()
+                   if r.run_mode == "SHADOW" and r.signal_time_ms > 0]
+        for rec in pending:
+            elapsed_ms = now * 1000 - rec.signal_time_ms
+            settle_ms = rec.expiry_minutes * 60000 + 30000
+            if elapsed_ms < settle_ms:
+                continue
+
+            rt = self._realtime_feed.get_realtime_price(rec.symbol) if self._realtime_feed else None
+            settle_price = rt.price if rt else rec.gate_price_at_signal
+
+            if rec.direction == "CALL":
+                is_win = settle_price > rec.gate_price_at_signal
+            else:
+                is_win = settle_price < rec.gate_price_at_signal
+            is_tie = abs(settle_price - rec.gate_price_at_signal) < 0.0001 * rec.gate_price_at_signal
+
+            payout = rec.payout_call if rec.direction == "CALL" else rec.payout_put
+            if is_tie:
+                pnl = 0.0
+                result = "TIE"
+            elif is_win:
+                pnl = rec.stake * payout
+                result = "WIN"
+            else:
+                pnl = -rec.stake
+                result = "LOSS"
+
+            self.trade_ledger.mark_settled(
+                rec.trade_id, result=result, pnl=pnl,
+                settlement_source="gate_price_proxy",
+                hibt_close_price=settle_price,
+            )
+
+            if not is_tie:
+                self.risk_manager.record_result(is_win)
+                self.calibrator.update(rec.calibrated_probability, 1 if is_win else 0)
+
+            emit("shadow_order_settled", {
+                "symbol": rec.symbol,
+                "result": result,
+                "pnl": round(pnl, 4),
+                "trade_id": rec.trade_id,
+                "settlement": "SHADOW_SETTLED",
+                "settle_price": settle_price,
+                "entry_price": rec.gate_price_at_signal,
+            })
+
+    # ═══════════════════════════════════════════════════════════
+    # Slow Context (15m)
+    # ═══════════════════════════════════════════════════════════
 
     def _update_slow_context(self, sym: str, df_1m: pd.DataFrame):
-        """每 15 分钟更新 Slow Context（用 15m K 线真实数据）"""
-        if df_1m is None or len(df_1m) < 15: return
+        """Update slow context every 15 minutes."""
+        if df_1m is None or len(df_1m) < 15:
+            return
         last_bar = df_1m.index[-1]
         last_update = self._last_slow_update.get(sym, 0)
         if hasattr(last_bar, 'timestamp'):
             bar_ts = last_bar.timestamp()
-            if bar_ts - last_update < 840: return
+            if bar_ts - last_update < 840:
+                return
             self._last_slow_update[sym] = bar_ts
 
-        # 用 15m K 线数据计算真实指标
-        df_15m = self._realtime_feed.get_klines(sym, "15m") if self._realtime_feed else None
-        if df_15m is None and self._realtime_feed:
-            # 从 1m 聚合 15m
+        # Use 15m candles
+        df_15m = None
+        if self._realtime_feed:
+            df_15m = self._realtime_feed.get_klines(sym, "15m")
+
+        if df_15m is None or len(df_15m) < 50:
+            # Aggregate from 1m
             df_15m_raw = df_1m.resample("15min").agg({
                 "open": "first", "high": "max", "low": "min",
                 "close": "last", "volume": "sum",
@@ -495,47 +671,21 @@ class TradingEngine:
         else:
             df_15m_raw = df_15m
 
+        indicators = {"ADX": 20.0, "RSI": 50.0, "BB_Pos": 0.5, "bb_width": 0.02,
+                       "volatility_ratio": 1.0, "ATR_pct": 0.003, "price_vs_MA20": 0.0,
+                       "MACD": 0.0, "MA_trend": 0.0, "VWAP_dist": 0.0, "vol_ratio": 1.0, "CCI": 0.0}
+
         if df_15m_raw is not None and len(df_15m_raw) >= 50:
-            # 计算真实指标
             closes = df_15m_raw["close"].values.astype(float)
             eps = 1e-10
-            # ADX approximation
-            adx = min(40.0, 20.0 + abs(float(np.mean(np.diff(closes[-20:])) / max(np.mean(closes[-20:]), eps) * 10000)))
-            # RSI
-            deltas = np.diff(closes[-15:])
-            gains = np.maximum(deltas, 0).mean()
-            losses = np.maximum(-deltas, 0).mean()
-            rs = gains / max(losses, eps)
-            rsi = float(100 - 100 / (1 + rs))
-            # BB position
             mid = float(np.mean(closes[-20:]))
             std = float(np.std(closes[-20:]))
-            bb_upper = mid + 2*std
-            bb_lower = mid - 2*std
-            bb_pos = float((closes[-1] - bb_lower) / max(bb_upper - bb_lower, eps))
-            bb_pos = max(0.0, min(1.0, bb_pos))
-            # Volatility ratio
-            vol_ratio = float(std / max(mid, eps) * 100)
-            vol_ratio = max(0.5, min(3.0, vol_ratio))
-            # Price vs MA20
-            ma20 = float(np.mean(closes[-20:]))
-            price_vs_ma20 = float((closes[-1] - ma20) / max(ma20, eps))
-            # MACD
-            ema12 = pd.Series(closes[-20:]).ewm(span=12, adjust=False).mean().values[-1]
-            ema26 = pd.Series(closes[-20:]).ewm(span=26, adjust=False).mean().values[-1] if len(closes) >= 26 else ema12
-            macd = float(ema12 - ema26)
-
-            indicators = {
-                "ADX": adx, "RSI": rsi, "BB_Pos": bb_pos, "bb_width": float(std/max(mid, eps)),
-                "volatility_ratio": vol_ratio, "ATR_pct": float(std/max(mid, eps)),
-                "price_vs_MA20": price_vs_ma20, "MACD": macd,
-                "MA_trend": 1.0 if closes[-1] > ma20 else -1.0,
-                "VWAP_dist": 0.0, "vol_ratio": 1.0, "CCI": 0.0,
-            }
-        else:
-            indicators = {"ADX": 20.0, "RSI": 50.0, "BB_Pos": 0.5, "bb_width": 0.02,
-                "volatility_ratio": 1.0, "ATR_pct": 0.003, "price_vs_MA20": 0.0,
-                "MACD": 0.0, "MA_trend": 0.0, "VWAP_dist": 0.0, "vol_ratio": 1.0, "CCI": 0.0}
+            indicators["ATR_pct"] = float(std / max(mid, eps))
+            indicators["ADX"] = min(40.0, 20.0 + abs(float(np.mean(np.diff(closes[-20:])) / max(np.mean(closes[-20:]), eps) * 10000)))
+            indicators["price_vs_MA20"] = float((closes[-1] - mid) / max(mid, eps))
+            indicators["BB_Pos"] = max(0.0, min(1.0, float((closes[-1] - (mid - 2*std)) / max(4*std, eps))))
+            indicators["volatility_ratio"] = max(0.5, min(3.0, float(std / max(mid, eps) * 100)))
+            indicators["bb_width"] = float(std / max(mid, eps))
 
         row = {"ret_1": 0.0, "ret_3": 0.0, "ret_6": 0.0, "body_pct": 0.3}
 
@@ -543,340 +693,108 @@ class TradingEngine:
             predictions = self.expert_manager.predict_all(sym, indicators, row)
             regime = self.regime_detector.detect(indicators)
             ensemble = self.expert_manager.ensemble(predictions, regime)
-            self._slow_context[sym] = {"probability": ensemble.ensemble_probability,
+            self._slow_context[sym] = {
+                "probability": ensemble.ensemble_probability,
                 "regime": regime.regime,
                 "trend_strength": float(indicators.get("ADX", 20)) / 40.0,
-                "volatility": float(indicators.get("volatility_ratio", 1.0))}
-        except Exception:
-            self._slow_context[sym] = {"probability": 0.50, "regime": "RANGE",
-                "trend_strength": 0.0, "volatility": 0.5}
-
-        # 发出 regime_update
-        emit("regime_update", {"symbol": sym, "regime": self._slow_context[sym]["regime"],
-            "confidence": 0.7, "adx": indicators.get("ADX", 20),
-            "volatility": indicators.get("volatility_ratio", 1.0)})
-
-    # ═══════════════════════════════════════════════════════════
-    # Order Execution (shared by Fast Entry + old 15m pipeline)
-    # ═══════════════════════════════════════════════════════════
-
-    def _execute_opportunity(self, candidate: CandidateOpportunity) -> bool:
-        symbol = candidate.symbol
-        direction_str = candidate.direction_str
-        direction_int = candidate.direction_int
-        edge = candidate.edge
-        ensemble = candidate.ensemble
-        regime = candidate.regime
-        indicators = candidate.indicators
-        current_price = candidate.current_price
-        current_ts = candidate.current_ts
-
-        pos = self.portfolio_risk.compute_position_size(edge, self.balance)
-        if not pos.allowed:
-            self._strat_funnel_count(symbol, "portfolio_rejected")
-            return False
-        stake_usd = pos.stake_usd
-
-        active_positions = {t.get("symbol", ""): [{"direction": t.get("direction_str", direction_str),
-            "stake_usd": t.get("amount", 0)}] for t in self.active_trades}
-        port_check = self.portfolio_risk.check_portfolio_limits(
-            symbol=symbol, direction=direction_str, stake_usd=stake_usd,
-            equity=self.balance, active_positions=active_positions)
-        if not port_check.allowed:
-            return False
-            # shadow 模式照常记录
-
-        if self.shadow.can_place_order():
-            if self._smoke_test and self._smoke_order_count >= self._smoke_max_orders:
-                return False
-            result = place_order(symbol, direction_int, stake_usd, config.HOLD_MINUTES)
-            if result.ok:
-                lifecycle = "ORDER_ACCEPTED" if result.order_id else "ORDER_REQUESTED"
-                rec = self.trade_ledger.create_record(
-                    symbol=symbol, direction=direction_str, direction_int=direction_int,
-                    entry_time_ms=current_ts, entry_price=current_price,
-                    stake_usd=stake_usd, expiry_minutes=config.HOLD_MINUTES,
-                    raw_probability=ensemble.ensemble_probability,
-                    calibrated_probability=edge.calibrated_probability,
-                    break_even_probability=edge.break_even_probability,
-                    effective_edge=edge.effective_edge,
-                    expected_roi=edge.expected_roi,
-                    net_payout_ratio=edge.net_payout_ratio,
-                    payout_source=edge.payout_source,
-                    regime=regime.regime if regime else "",
-                    expert_votes=ensemble.expert_votes if ensemble else {})
-                if result.order_id: rec.hibt_order_id = result.order_id
-                rec.settlement_status = lifecycle
-                self.trade_ledger.save(rec)
-
-                self.active_trades.append({
-                    "symbol": symbol, "dir": direction_int, "direction_str": direction_str,
-                    "start_ts": current_ts, "amount": stake_usd,
-                    "entry": current_price, "pre_balance": self.balance,
-                    "trade_id": rec.trade_id, "hibt_order_id": result.order_id,
-                    "lifecycle": lifecycle,
-                    "open_price_verified": result.open_price is not None,
-                    "predicted_entry_price": current_price,
-                    "hibt_open_price": result.open_price})
-
-                if self._smoke_test:
-                    self._smoke_order_count += 1
-                    if self._smoke_order_count >= self._smoke_max_orders:
-                        emit("log", {"msg": "SMOKE_TEST: limit reached"})
-
-                emit("trade_executed", {"symbol": symbol, "direction": direction_str,
-                    "trade_id": rec.trade_id, "hibt_order_id": result.order_id,
-                    "entryPrice": current_price, "amount": stake_usd,
-                    "rawProbability": ensemble.ensemble_probability,
-                    "calibratedProbability": edge.calibrated_probability,
-                    "effectiveEdge": edge.effective_edge,
-                    "expectedRoi": edge.expected_roi,
-                    "edgeFlag": edge.edge_flag,
-                    "balance": self.balance, "lifecycle": lifecycle,
-                    "open_price_verified": result.open_price is not None,
-                    "predicted_entry_price": current_price,
-                    "hibt_open_price": result.open_price,
-                    # Payout/Settlement verification
-                    "payout_verified": edge.payout_verified,
-                    "payout_flag": edge.payout_flag,
-                    "payout_source": edge.payout_source,
-                    "settlement_verified": False,
-                    "position_size_basis": "BASED_ON_ASSUMED_PAYOUT" if not edge.payout_verified else "BASED_ON_VERIFIED_PAYOUT"})
-
-                self.balance = fetch_balance()
-                if self.balance < 0: self.balance = self.balance - stake_usd
-                emit("balance_update", {"balance": self.balance})
-                return True
-            else:
-                emit("trade_rejected", {"symbol": symbol, "reason": "ORDER_FAILED", "detail": result.msg})
-                return False
-        else:
-            # SHADOW_ACTIVE — 创建真正的影子订单，加入 active_trades 等待结算
-            self._strat_funnel_count(symbol, "shadow_trade")
-            trade_id = f"shadow_{int(time.time()*1000)}_{symbol.lower()}_{direction_str.lower()}"
-            shadow_trade = {
-                "symbol": symbol, "dir": direction_int, "direction_str": direction_str,
-                "start_ts": current_ts, "amount": stake_usd,
-                "entry": current_price, "pre_balance": self.balance,
-                "trade_id": trade_id, "hibt_order_id": None,
-                "lifecycle": "SHADOW_ORDER_CREATED",
-                "open_price_verified": False,
-                "predicted_entry_price": current_price,
-                "hibt_open_price": None,
+                "volatility": float(indicators.get("volatility_ratio", 1.0)),
             }
-            self.active_trades.append(shadow_trade)
-
-            self.shadow.record_shadow_trade(
-                symbol=symbol, direction=direction_str, direction_int=direction_int,
-                entry_time_ms=current_ts, entry_price=current_price,
-                stake_usd=stake_usd, expiry_minutes=config.HOLD_MINUTES,
-                calibrated_probability=edge.calibrated_probability,
-                break_even_probability=edge.break_even_probability,
-                effective_edge=edge.effective_edge,
-                expected_roi=edge.expected_roi,
-                regime=regime.regime if regime else "",
-                expert_votes=ensemble.expert_votes if ensemble else {})
-
-            # 更新 shadow balance 模拟
-            if getattr(self, '_shadow_simulated_balance', False):
-                self.balance -= stake_usd
-
-            emit("shadow_order_created", {"symbol": symbol, "direction": direction_str,
-                "trade_id": trade_id, "entryPrice": current_price, "amount": stake_usd,
-                "effectiveEdge": edge.effective_edge, "expectedRoi": edge.expected_roi,
-                "lifecycle": "SHADOW_ORDER_CREATED"})
-            return True
+        except Exception:
+            self._slow_context[sym] = {
+                "probability": 0.50, "regime": "RANGE",
+                "trend_strength": 0.0, "volatility": 0.5,
+            }
 
     # ═══════════════════════════════════════════════════════════
-    # Settlement
-    # ═══════════════════════════════════════════════════════════
-
-    def _check_settlement(self):
-        if not self.active_trades: return
-        current_balance = fetch_balance()
-        if current_balance < 0: return
-        if getattr(self, '_shadow_simulated_balance', False):
-            current_balance = self.balance
-
-        for i in range(len(self.active_trades) - 1, -1, -1):
-            t = self.active_trades[i]
-            elapsed_ms = time.time() * 1000 - t["start_ts"]
-            settle_ms = config.HOLD_MINUTES * 60000 + 30000
-            if elapsed_ms < settle_ms: continue
-
-            is_shadow = t.get("lifecycle", "").startswith("SHADOW_ORDER")
-
-            if is_shadow:
-                # ── 影子订单：用当前价格模拟结算 ──
-                # 获取实时价格
-                rt = self._realtime_feed.get_realtime_price(t["symbol"]) if self._realtime_feed else None
-                if rt is None:
-                    # 无法获取价格，用 entry price 作为近似
-                    settle_price = t.get("entry", 0)
-                else:
-                    settle_price = rt.price
-
-                if t.get("direction_str") == "CALL":
-                    is_win = settle_price > t.get("entry", 0)
-                else:
-                    is_win = settle_price < t.get("entry", 0)
-                is_tie = abs(settle_price - t.get("entry", 0)) < 0.0001 * t.get("entry", 1)
-
-                # 影子赔付用配置的 payout
-                payout = config.PAYOUT_RATES.get(t["symbol"], 0.80)
-                if is_tie:
-                    pnl = 0.0
-                    result = "TIE"
-                elif is_win:
-                    pnl = t["amount"] * payout
-                    result = "WIN"
-                else:
-                    pnl = -t["amount"]
-                    result = "LOSS"
-
-                t["lifecycle"] = "SHADOW_ORDER_SETTLED"
-                self.balance += pnl
-                if is_win: self.total_wins += 1
-                elif not is_tie: self.total_losses += 1
-                self.total_pnl += pnl
-                if not is_tie: self._record_result(is_win)
-
-                trade_id = t.get("trade_id", "")
-                if trade_id:
-                    self.trade_ledger._update_field(trade_id, "settlement_status", "SHADOW_SETTLED")
-                    self.trade_ledger._update_field(trade_id, "result", result)
-                    self.trade_ledger._update_field(trade_id, "realized_pnl", pnl)
-
-                emit("shadow_order_settled", {"symbol": t["symbol"], "result": result,
-                    "pnl": round(pnl, 4), "trade_id": trade_id,
-                    "settlement": "SHADOW_SETTLED",
-                    "settle_price": settle_price, "entry_price": t.get("entry"),
-                    "lifecycle": "SHADOW_ORDER_SETTLED"})
-            else:
-                # ── 真实订单：余额变化法结算 ──
-                # ⚠️ 不是 HIBT 官方订单级 Settlement，只是余额推断
-                raw_pnl = current_balance - t["pre_balance"]
-                is_win = raw_pnl > 0; is_tie = abs(raw_pnl) < 0.001
-
-                # ── PnL 合理性校验 ──
-                # 余额变化法容易被前一笔结算的余额波动污染，导致错误 PnL
-                # 例如 stake=3, payout=0.8, WIN 应该是 +2.4，但余额变了 +7.914
-                # 用预设的 net_payout_ratio 计算期望 PnL，如果偏差过大就用期望值
-                stake_amount = t.get("amount", 3)
-                payout_rate = config.PAYOUT_RATES.get(t["symbol"], 0.80)
-                expected_win_pnl = stake_amount * payout_rate   # 赢单应得
-                expected_loss_pnl = -stake_amount               # 输单应亏
-                if is_win and raw_pnl > 0:
-                    if abs(raw_pnl - expected_win_pnl) > max(expected_win_pnl * 0.5, 1.5):
-                        pnl = expected_win_pnl
-                        emit("log", {"msg": f"PnL SANITY: {t['symbol']} {t.get('direction_str','')} "
-                            f"balance_inferred={raw_pnl:.4f} expected_win={expected_win_pnl:.4f} "
-                            f"→ using expected | likely stale pre_balance"})
-                    else:
-                        pnl = raw_pnl
-                elif not is_win and not is_tie:
-                    if abs(raw_pnl - expected_loss_pnl) > max(stake_amount * 0.5, 1.5):
-                        pnl = expected_loss_pnl
-                        emit("log", {"msg": f"PnL SANITY: {t['symbol']} {t.get('direction_str','')} "
-                            f"balance_inferred={raw_pnl:.4f} expected_loss={expected_loss_pnl:.4f} "
-                            f"→ using expected | likely stale pre_balance"})
-                    else:
-                        pnl = raw_pnl
-                else:
-                    pnl = raw_pnl
-                if is_win: self.total_wins += 1
-                elif not is_tie: self.total_losses += 1
-                self.total_pnl += pnl
-                if not is_tie: self._record_result(is_win)
-                result = "tie" if is_tie else ("win" if is_win else "loss")
-
-                # ── Settlement Ambiguity Detection ──
-                # 统计同时有多少真实订单在结算窗口内
-                real_trade_count = sum(1 for tt in self.active_trades
-                    if not tt.get("lifecycle", "").startswith("SHADOW_ORDER"))
-                settlement_status = "SETTLED_BALANCE_INFERRED"
-                settlement_verified = False
-                # 如果有唯一真实订单且没有其他已知资金变化
-                if real_trade_count == 1:
-                    settlement_label = "BALANCE_INFERRED_SINGLE_ORDER"
-                else:
-                    settlement_label = "SETTLEMENT_AMBIGUOUS"
-
-                trade_id = t.get("trade_id", "")
-                if trade_id:
-                    self.settlement_ledger.estimate_settlement(trade_id=trade_id,
-                        current_balance=current_balance, pre_balance=t["pre_balance"])
-                    self.trade_ledger._update_field(trade_id, "settlement_status", settlement_status)
-                    self.trade_ledger._update_field(trade_id, "settlement_verified", False)
-                    self.trade_ledger._update_field(trade_id, "settlement_label", settlement_label)
-
-                emit("trade_result", {"symbol": t["symbol"], "result": result,
-                    "pnl": round(pnl, 4), "trade_id": trade_id,
-                    "settlement": settlement_label,
-                    "settlement_verified": settlement_verified,
-                    "settlement_status": settlement_status,
-                    "hibt_order_id": t.get("hibt_order_id"),
-                    "open_price_verified": t.get("open_price_verified", False),
-                    "predicted_entry_price": t.get("predicted_entry_price"),
-                    "hibt_open_price": t.get("hibt_open_price")})
-
-            self._health_trades.append({"predicted_prob": 0.50, "result": "WIN" if is_win else ("TIE" if is_tie else "LOSS"), "pnl": pnl})
-            if len(self._health_trades) > 500: self._health_trades = self._health_trades[-500:]
-            self.portfolio_risk.record_pnl(pnl)
-            self.active_trades.pop(i)
-            # 结算后重置该币种集中度计数器，防止死锁
-            sym = t.get("symbol", "")
-            if sym and self._consecutive_same_symbol.get(sym, 0) >= 3:
-                self._consecutive_same_symbol[sym] = 0
-            if not is_shadow:
-                current_balance = self.balance
-            else:
-                current_balance = self.balance
-            emit("balance_update", {"balance": self.balance})
-
-    def _record_result(self, is_win: bool):
-        self.recent_results.append(is_win)
-        if len(self.recent_results) > config.RECENT_WINDOW:
-            self.recent_results = self.recent_results[-config.RECENT_WINDOW:]
-        if is_win: self.consecutive_losses = 0
-        else:
-            self.consecutive_losses += 1
-            if self.consecutive_losses >= config.CONSECUTIVE_LOSS_HALT:
-                self.halted = True
-            elif self.consecutive_losses >= 3:
-                self.pause_until = int(time.time() * 1000) + config.CONSECUTIVE_LOSS_PAUSE_SEC * 1000
-
-    # ═══════════════════════════════════════════════════════════
-    # Main Tick
+    # Main Tick + Helpers
     # ═══════════════════════════════════════════════════════════
 
     def tick(self):
-        self._sys_funnel_count("ticks_total")
         try:
             self._check_settlement()
             self._run_fast_entry_scan()
             self._emit_funnel_report()
         except Exception as e:
-            emit("error", {"msg": f"Error: {str(e)[:100]}"})
+            emit("error", {"msg": f"Error: {str(e)[:200]}"})
 
     def get_status(self) -> dict:
-        total = self.total_wins + self.total_losses
-        wr = f"{(self.total_wins / total * 100):.1f}%" if total > 0 else "0.0%"
-        state = "halted" if self.halted else ("paused" if self.paused else ("running" if self.running else "stopped"))
-        if self.pause_until > int(time.time() * 1000): state = "cooling"
-        profit = self.balance - self.start_balance if self.start_balance > 0 else 0
         cal_ready = self.calibrator.is_ready()
-        return {"state": state, "balance": self.balance,
-            "wins": self.total_wins, "losses": self.total_losses,
-            "winRate": wr, "activeTrades": len(self.active_trades),
-            "maxConcurrentTrades": config.MAX_ACTIVE_EVENT_CONTRACTS,
-            "consecutiveLosses": self.consecutive_losses,
-            "currentBet": config.MIN_ORDER_USD, "betMode": "fast_entry_kelly",
-            "profit": round(profit, 2), "runMode": self.shadow.get_mode(),
+        settled = self.trade_ledger.get_settled_count()
+        total = settled["wins"] + settled["losses"]
+        wr = f"{(settled['wins'] / total * 100):.1f}%" if total > 0 else "0.0%"
+        profit = self.balance - self.start_balance
+
+        run_mode = self.run_mode_mgr.mode
+        symbol_modes = {}
+        for sym in list(config.SHADOW_SYMBOL_MODE.keys()):
+            symbol_modes[sym] = self.run_mode_mgr.get_symbol_mode(sym)
+
+        return {
+            "state": "running" if self.running else "stopped",
+            "balance": self.balance,
+            "wins": settled["wins"], "losses": settled["losses"],
+            "winRate": wr,
+            "activeTrades": len(self.active_hibt_order_ids),
+            "maxConcurrentTrades": self.risk_manager.max_concurrent_orders,
+            "consecutiveLosses": self.risk_manager.get_status()["consecutive_losses"],
+            "currentBet": config.MIN_ORDER_USD,
+            "betMode": "ev_based",
+            "profit": round(profit, 2),
+            "runMode": run_mode.value,
             "calibrationReady": cal_ready,
-            "healthTradeCount": len(self._health_trades),
-            "liveGate": self.shadow.get_live_gate_status(cal_ready),
-            "symbolModes": self.shadow.get_symbol_mode_summary(),
+            "healthTradeCount": settled["total"],
+            "liveGate": self.run_mode_mgr.get_live_gate().check(
+                calibrator_ready=cal_ready,
+                data_fresh=True,
+                model_valid=self._fast_model_loaded,
+                has_pending_orders=len(self.trade_ledger.get_pending_settlements()) > 0,
+                risk_paused=self.risk_manager.get_status()["paused"],
+                settlement_available=self.reconciler.can_settle_via_hibt(),
+                payout_available=(self.reconciler.get_available_payout("BTCUSDT")[0] is not None),
+            ).__dict__ if hasattr(self.run_mode_mgr.get_live_gate().check, '__dict__') else {},
+            "symbolModes": symbol_modes,
             "fastScanCount": self._fast_scan_count,
             "fastScanInterval": config.FAST_SCAN_INTERVAL_SECONDS,
-            "fastModelLoaded": self._fast_model_loaded}
+            "fastModelLoaded": self._fast_model_loaded,
+            "risk": self.risk_manager.get_status(),
+        }
+
+    def set_run_mode(self, mode: str):
+        """Set run mode from frontend command."""
+        if mode == "paper":
+            self.run_mode_mgr.set_paper()
+        elif mode == "live":
+            self.run_mode_mgr.attempt_live()
+        else:
+            self.run_mode_mgr.set_shadow()
+
+    def _strat_funnel_count(self, symbol: str, stage: str):
+        if symbol not in self._strat_funnel:
+            self._strat_funnel[symbol] = {}
+        self._strat_funnel[symbol][stage] = self._strat_funnel[symbol].get(stage, 0) + 1
+
+    def _emit_funnel_report(self):
+        now = time.time()
+        if now - self._funnel_last_report < 60:
+            return
+        self._funnel_last_report = now
+        emit("funnel", {
+            "type": "system",
+            "fast_scans": self._fast_scan_count,
+        })
+        for sym in sorted(self._strat_funnel.keys()):
+            f = self._strat_funnel[sym]
+            emit("funnel", {"type": "strategy", "symbol": sym,
+                "reject_insufficient_ev": f.get("reject_insufficient_ev", 0),
+                "reject_payout_not_verified": f.get("reject_payout_not_verified", 0),
+                "decision_passed": f.get("decision_passed", 0),
+                "shadow_trade": f.get("shadow_trade", 0),
+                "risk_symbol_disabled": f.get("risk_symbol_disabled", 0),
+                "risk_consecutive_loss_pause": f.get("risk_consecutive_loss_pause", 0),
+                "risk_daily_loss_limit": f.get("risk_daily_loss_limit", 0),
+                "risk_daily_max_trades": f.get("risk_daily_max_trades", 0),
+                "risk_max_concurrent_orders": f.get("risk_max_concurrent_orders", 0),
+                "cooldown_rejected": f.get("cooldown_rejected", 0),
+                "concentration_rejected": f.get("concentration_rejected", 0),
+                "max_hourly_rejected": f.get("max_hourly_rejected", 0),
+            })

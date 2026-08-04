@@ -15,6 +15,12 @@ if _env_local.exists():
         if key and not os.environ.get(key):  # Don't override actual env vars
             os.environ[key] = val
 
+# --- Run Mode ---
+# ENABLE_LIVE_TRADING: must be "true" + admin confirmation + all gate checks passed
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+BACKTEST_MODE = os.getenv("BACKTEST_MODE", "false").lower() == "true"
+DEFAULT_RUN_MODE = "paper" if BACKTEST_MODE else "shadow"  # Always default to SHADOW on restart
+
 # --- AI ---
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_URL = os.getenv("AI_URL", "https://api.siliconflow.cn/v1/chat/completions")
@@ -187,5 +193,13 @@ MAX_ACTIVE_EVENT_CONTRACTS = int(os.getenv("MAX_ACTIVE_EVENT_CONTRACTS", "1"))
 MIN_DIRECTION_STRENGTH = float(os.getenv("MIN_DIRECTION_STRENGTH", "0.08"))  # 概率必须偏离 0.50 至少 8%
 # 即 ensemble_prob >= 0.58 才开 CALL， ensemble_prob <= 0.42 才开 PUT
 
+# ── Decision Engine ──
+MIN_EXPECTED_VALUE = float(os.getenv("MIN_EXPECTED_VALUE", "0.03"))    # Minimum EV to open a trade
+
 # ── Payout Source ──
 PAYOUT_SOURCE = os.getenv("PAYOUT_SOURCE", "hardcoded")  # "api" / "hardcoded" / "estimated"
+PAYOUT_REQUIRE_API_FOR_LIVE = os.getenv("PAYOUT_REQUIRE_API_FOR_LIVE", "true").lower() == "true"
+
+# ── Settlement ──
+SETTLEMENT_REQUIRE_HIBT_FOR_LIVE = os.getenv("SETTLEMENT_REQUIRE_HIBT_FOR_LIVE", "true").lower() == "true"
+# If true, LIVE is blocked when HIBT doesn't return per-order settlement data

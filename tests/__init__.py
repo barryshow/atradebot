@@ -1,0 +1,1 @@
+# ATradeBot tests
