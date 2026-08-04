@@ -171,6 +171,7 @@ class TradingEngine:
             emit("funnel", {"type": "strategy", "symbol": sym,
                 "edge_rejected": f.get("edge_rejected", 0),
                 "edge_passed": f.get("edge_passed", 0),
+                "weak_direction_rejected": f.get("weak_direction_rejected", 0),
                 "chop_rejected": f.get("chop_rejected", 0),
                 "concentration_rejected": f.get("concentration_rejected", 0),
                 "cooldown_rejected": f.get("cooldown_rejected", 0),
@@ -359,6 +360,12 @@ class TradingEngine:
             # ── 窄幅震荡行情自动降频 ──
             # 当 ATR% < 0.3%，ADX < 18 或 NATR < 0.008 → 区间震荡，不提方向信号
             status = ""  # 初始化为空，后续条件限定后覆盖
+
+            # ── 信号方向强度检查（优先于所有其他判定） ──
+            # 概率必须在 0.50±阈值 之外，防止 0.501/0.499 的伪信号开单
+            direction_strength = abs(ensemble_prob - 0.50)
+            if direction_strength < config.MIN_DIRECTION_STRENGTH:
+                status = "WEAK_DIRECTION"
             adx_val = float(fast_features.get("ADX", 20))
             atr_pct = float(fast_features.get("ATR_pct", 1.0))
             natr_val = float(fast_features.get("NATR", 0.01))
@@ -405,6 +412,8 @@ class TradingEngine:
 
             if not edge.passed:
                 self._strat_funnel_count(sym, "edge_rejected"); continue
+            if status == "WEAK_DIRECTION":
+                self._strat_funnel_count(sym, "weak_direction_rejected"); continue
             if in_chop_low_prob:
                 self._strat_funnel_count(sym, "chop_rejected"); continue
             if same_sym_count >= 3:

@@ -21,7 +21,7 @@ class OpportunityRanker:
 
     def __init__(self):
         self.correlation_penalty = 0.30  # 同向关联惩罚
-        self.max_selected = 3  # 每周期最多选择
+        self.max_selected = 1  # 每周期只选最优的1个（质量控制）
 
     def rank(self, opportunities: List[EdgeResult]) -> List[Opportunity]:
         """

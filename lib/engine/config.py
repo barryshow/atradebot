@@ -42,14 +42,14 @@ CANDLE_INTERVAL_MIN = int(os.getenv("CANDLE_INTERVAL_MIN", "1"))
 # 特征计算聚合粒度（分钟） — 用更长时间窗口算特征，保持模型兼容
 FEATURE_INTERVAL_MIN = int(os.getenv("FEATURE_INTERVAL_MIN", "15"))
 
-MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "999"))  # 不限制
-TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "120"))
+MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES", "1"))  # 同一时间只持1单
+TRADE_COOLDOWN_SEC = int(os.getenv("TRADE_COOLDOWN_SEC", "300"))
 
 # --- 本金管理: 凯利滚仓 ---
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "14"))
 
 # --- 凯利公式参数 ---
-KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.50"))   # 半凯利(保守), 可调
+KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))   # 1/4凯利(保守), 可调
 BET_MIN = int(os.getenv("BET_MIN", "3"))                       # 最低3U
 BET_MAX = int(os.getenv("BET_MAX", "50"))                      # 上限
 
@@ -66,7 +66,7 @@ BB_EXTREME_HIGH = float(os.getenv("BB_EXTREME_HIGH", "0.72"))
 BB_EXTREME_LOW = float(os.getenv("BB_EXTREME_LOW", "0.28"))
 BB_OSCILLATE_LONG = float(os.getenv("BB_OSCILLATE_LONG", "0.25"))
 BB_OSCILLATE_SHORT = float(os.getenv("BB_OSCILLATE_SHORT", "0.75"))
-MIN_PROBABILITY = float(os.getenv("MIN_PROBABILITY", "0.30"))
+MIN_PROBABILITY = float(os.getenv("MIN_PROBABILITY", "0.55"))   # 最低概率门槛（高于 0.50，防止无方向信号）
 
 # --- SignalValidator 配置 ---
 # L0: 防接刀（Anti-Knife Filter）
@@ -158,12 +158,12 @@ KELLY_MIN_CONFIDENCE = float(os.getenv("KELLY_MIN_CONFIDENCE", "0.25"))  # 最�
 SMALL_ACCOUNT_MAX_BET_FRACTION = float(os.getenv("SMALL_ACCOUNT_MAX_BET_FRACTION", "0.0"))  # 0=禁止自动放宽
 
 # ── Edge Engine ──
-MIN_EFFECTIVE_EDGE = float(os.getenv("MIN_EFFECTIVE_EDGE", "0.02"))       # 最小有效优势 (2%)
-MIN_EXPECTED_ROI = float(os.getenv("MIN_EXPECTED_ROI", "0.005"))           # 最小期望ROI (0.5%)
+MIN_EFFECTIVE_EDGE = float(os.getenv("MIN_EFFECTIVE_EDGE", "0.05"))       # 最小有效优势 (5%, 严格要求)
+MIN_EXPECTED_ROI = float(os.getenv("MIN_EXPECTED_ROI", "0.03"))           # 最小期望ROI (3%, 不再接受薄利)
 
 # ── Uncertainty ──
-DEFAULT_UNCERTAINTY_MARGIN = float(os.getenv("DEFAULT_UNCERTAINTY_MARGIN", "0.02"))    # 默认不确定性折扣
-DEFAULT_CALIBRATION_MARGIN = float(os.getenv("DEFAULT_CALIBRATION_MARGIN", "0.01"))    # 默认校准折扣
+DEFAULT_UNCERTAINTY_MARGIN = float(os.getenv("DEFAULT_UNCERTAINTY_MARGIN", "0.03"))    # 默认不确定性折扣 (更保守)
+DEFAULT_CALIBRATION_MARGIN = float(os.getenv("DEFAULT_CALIBRATION_MARGIN", "0.015"))    # 默认校准折扣 (更保守)
 DEFAULT_DEGRADATION_MARGIN = float(os.getenv("DEFAULT_DEGRADATION_MARGIN", "0.00"))    # 默认模型退化折扣
 
 # ── Model Health ──
@@ -180,8 +180,12 @@ FAST_SCAN_INTERVAL_SECONDS = int(os.getenv("FAST_SCAN_INTERVAL_SECONDS", "5"))
 SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "60"))
 ALLOW_SAME_DIRECTION_STACKING = os.getenv("ALLOW_SAME_DIRECTION_STACKING", "false").lower() == "true"
 ALLOW_OPPOSITE_OVERLAP = os.getenv("ALLOW_OPPOSITE_OVERLAP", "false").lower() == "true"
-MAX_NEW_TRADES_PER_HOUR = int(os.getenv("MAX_NEW_TRADES_PER_HOUR", "4"))
-MAX_ACTIVE_EVENT_CONTRACTS = int(os.getenv("MAX_ACTIVE_EVENT_CONTRACTS", "3"))
+MAX_NEW_TRADES_PER_HOUR = int(os.getenv("MAX_NEW_TRADES_PER_HOUR", "3"))
+MAX_ACTIVE_EVENT_CONTRACTS = int(os.getenv("MAX_ACTIVE_EVENT_CONTRACTS", "1"))
+
+# ── Direction Strength（信号方向必须足够强，防止 0.501 就开单） ──
+MIN_DIRECTION_STRENGTH = float(os.getenv("MIN_DIRECTION_STRENGTH", "0.08"))  # 概率必须偏离 0.50 至少 8%
+# 即 ensemble_prob >= 0.58 才开 CALL， ensemble_prob <= 0.42 才开 PUT
 
 # ── Payout Source ──
 PAYOUT_SOURCE = os.getenv("PAYOUT_SOURCE", "hardcoded")  # "api" / "hardcoded" / "estimated"
